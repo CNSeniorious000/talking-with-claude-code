@@ -29,7 +29,8 @@ function readRegistration(file) {
 function processIdentity(row) {
   try { process.kill(row.pid,0); } catch(e) { if(e.code==='ESRCH')return 'gone'; throw e; }
   // Claude records lstart in UTC; local-time comparison falsely treats every PID as reused.
-  const start=execFileSync('/bin/ps',['-p',String(row.pid),'-o','lstart='],{encoding:'utf8',timeout:3000,env:{...process.env,TZ:'UTC',LC_ALL:'C'}}).trim();
+  const procStat=process.platform==='linux'?readFileSync(`/proc/${row.pid}/stat`,'utf8'):null;
+  const start=procStat!==null ? procStat.slice(procStat.lastIndexOf(')')+2).split(/\s+/)[19] : execFileSync('/bin/ps',['-p',String(row.pid),'-o','lstart='],{encoding:'utf8',timeout:3000,env:{...process.env,TZ:'UTC',LC_ALL:'C'}}).trim();
   if(!start)return 'gone';
   return typeof row.procStart==='string'&&normalize(row.procStart)===normalize(start)?'verified':'unverified';
 }
@@ -63,6 +64,32 @@ function content(row,events) {
     return [];
   }).join('\n');
 }
+function relinkCompaction(nodes,warnings) {
+  const entries=[...nodes.values()], boundaries=entries.filter(r=>r.type==='system'&&r.subtype==='compact_boundary');
+  if(!boundaries.some(r=>r.compactMetadata?.preservedMessages||r.compactMetadata?.preservedSegment))return {};
+  const boundary=boundaries.at(-1),meta=boundary.compactMetadata||{},cut=entries.indexOf(boundary);
+  let kept=meta.preservedMessages;
+  if(!kept&&meta.preservedSegment){
+    const segment=meta.preservedSegment,ids=[],seen=new Set();let node=nodes.get(segment.tailUuid);
+    while(node&&!seen.has(node.uuid)){seen.add(node.uuid);ids.unshift(node.uuid);if(node.uuid===segment.headUuid)break;node=nodes.get(node.parentUuid);}
+    if(ids[0]!==segment.headUuid){warnings.push('Cannot reconstruct preserved compaction segment');return {incomplete:true};}
+    kept={anchorUuid:segment.anchorUuid,uuids:ids};
+  }
+  const ids=kept?.uuids||[];
+  if(!Array.isArray(ids)||new Set(ids).size!==ids.length||ids.some(id=>!nodes.has(id))||(ids.length&&(!nodes.has(kept.anchorUuid)||ids.includes(kept.anchorUuid)))){
+    warnings.push('Preserved compaction references are incomplete or invalid');return {incomplete:true};
+  }
+  // Compaction keeps selected old turns but changes their place in the active parent chain.
+  if(ids.length){
+    let parent=kept.anchorUuid;
+    for(const id of ids){nodes.set(id,{...nodes.get(id),parentUuid:parent});parent=id;}
+    for(const [id,node] of nodes)if(node.parentUuid===kept.anchorUuid&&id!==ids[0])nodes.set(id,{...node,parentUuid:parent});
+  }
+  const retained=new Set(ids),removed=new Set(entries.slice(0,cut).filter(r=>!retained.has(r.uuid)).map(r=>r.uuid));
+  for(const id of removed)nodes.delete(id);
+  if(ids.length)for(const [id,node] of nodes)if(['user','assistant'].includes(node.type)&&removed.has(node.parentUuid))nodes.set(id,{...node,parentUuid:ids.at(-1)});
+  return {tail:ids.at(-1),boundary:boundary.uuid};
+}
 async function conversation(id,events=false) {
   const file=await transcriptPath(id),records=[],warnings=[];
   let line=0;
@@ -71,8 +98,11 @@ async function conversation(id,events=false) {
     try { records.push(JSON.parse(text)); } catch { warnings.push(`Unparsed transcript line ${line}; it may be an incomplete write`); }
   }
   const nodes=new Map(records.filter(r=>r.uuid).map(r=>[r.uuid,r]));
-  const last=records.findLast(r=>['user','assistant'].includes(r.type)&&r.uuid&&!r.isSidechain);
-  let branch=records,ancestryIncomplete=false;
+  const compact=relinkCompaction(nodes,warnings);let ancestryIncomplete=!!compact.incomplete;
+  const after=compact.tail?records.slice(records.findIndex(r=>r.uuid===compact.boundary)+1):[...nodes.values()];
+  const leaf=after.findLast(r=>['user','assistant'].includes(r.type)&&r.uuid&&!r.isSidechain);
+  const last=nodes.get(leaf?.uuid||compact.tail);
+  let branch=[...nodes.values()];
   if(last) {
     const chain=[],visited=new Set();let node=last;
     while(node){ if(visited.has(node.uuid)){warnings.push('Conversation ancestry contains a cycle');break} visited.add(node.uuid);chain.push(node);if(!node.parentUuid)break;const parent=nodes.get(node.parentUuid);if(!parent){ancestryIncomplete=true;break}node=parent; }
@@ -86,19 +116,20 @@ async function conversation(id,events=false) {
     if(event&&!events)return [];
     return [{id:r.uuid||null,role:summary?'context':peer?'peer':event?'event':r.type,timestamp:r.timestamp||null,text,...peer&&{from:r.origin.from}}];
   });
-  return {source:file,messages,cursor:last?.uuid||null,ancestryIncomplete,warnings};
+  return {source:file,messages,branchIds:branch.map(r=>r.uuid),cursor:last?.uuid||null,ancestryIncomplete,warnings};
 }
 function page(data) {
   if(args.before&&args.after)fail('invalid_argument','Use --before or --after, not both');
   let messages=data.messages;
   const anchor=args.before||args.after;
-  if(anchor){const index=messages.findIndex(m=>m.id===anchor);if(index<0)fail('cursor_missing','Cursor is not a visible message on this conversation branch; reread without the cursor or with --events');messages=args.before?messages.slice(0,index):messages.slice(index+1);}
+  if(anchor){const index=data.branchIds.indexOf(anchor);if(index<0)fail('cursor_missing','Cursor is not on the current conversation branch; reread without the cursor');const ids=new Set(args.before?data.branchIds.slice(0,index):data.branchIds.slice(index+1));messages=messages.filter(m=>ids.has(m.id));}
   const tail=number('tail',12,100000),budget=number('max-chars',12000,1000000),total=messages.length;
   if(tail)messages=messages.slice(-tail);
   let left=budget,truncated=messages.length<total;
   // Budget from newest backwards so an old long message cannot hide the latest request.
   messages=messages.slice().reverse().flatMap(m=>{if(left===0){truncated=true;return []}const text=m.text.slice(0,left),cut=text.length<m.text.length;left-=text.length;truncated ||= cut;return [{...m,text,...cut&&{truncated:true}}]}).reverse();
-  return {...data,messages,availableMessages:total,truncated,firstCursor:messages[0]?.id||null,lastCursor:messages.at(-1)?.id||null};
+  const {branchIds,...visible}=data;
+  return {...visible,messages,availableMessages:total,truncated,firstCursor:messages[0]?.id||null,lastCursor:messages.at(-1)?.id||null};
 }
 function socketIdentity(row) {
   if(processIdentity(row)!=='verified')fail('process_changed','Process start time is missing or no longer matches the registration');
@@ -114,7 +145,7 @@ async function send() {
   const text=args.text==='-'?await Bun.stdin.text():args.text;if(!text.trim())fail('invalid_argument','Message must not be empty');
   const file=join(root,'sessions',`${pid}.json`),row=readRegistration(file);
   if(row.sessionId!==id)fail('target_mismatch','UUID and PID do not refer to the same registered session');
-  const socket=socketIdentity(row),msgId=randomUUID(),payload=JSON.stringify({type:'user',uuid:msgId,msg_id:msgId,from:'external-agent',message:{role:'user',content:text}})+'\n';
+  const socket=socketIdentity(row),msgId=randomUUID(),payload=JSON.stringify({type:'user',session_id:id,uuid:msgId,msg_id:msgId,from:'external-agent',message:{role:'user',content:text}})+'\n';
   if(payload.length>1000000)fail('message_too_large','Serialized message exceeds 1,000,000 characters');
   let cursor=null;try{cursor=(await conversation(id,true)).messages.at(-1)?.id||null}catch(e){if(e.code!=='transcript_missing')throw e}
   await new Promise((resolve,reject)=>{
