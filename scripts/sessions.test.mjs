@@ -134,7 +134,10 @@ test('a half-closed peer that stops reading cannot leave a write hanging', async
   await fixture(async f => {
     const result = await f.send('x'.repeat(900000));
     expect(bytes).toBeGreaterThan(0); expect(bytes).toBeLessThan(900000);
-    expect(result.code).toBe(1); expect(result.data.error).toBe('outcome_unknown'); expect(f.connections()).toBe(1);
+    // Some kernels buffer the entire frame before pause takes effect; local completion still cannot prove consumption.
+    if (result.code === 0) expect(result.data).toMatchObject({ status: 'submitted', acceptance: 'unconfirmed' });
+    else { expect(result.code).toBe(1); expect(result.data.error).toBe('outcome_unknown'); }
+    expect(f.connections()).toBe(1);
   }, { onData(socket, chunk) { bytes += Buffer.byteLength(chunk); socket.pause(); socket.end(); } });
 }, 10000);
 
