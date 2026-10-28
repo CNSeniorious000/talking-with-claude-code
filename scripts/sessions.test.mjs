@@ -266,6 +266,21 @@ for (const mode of ['linear', 'ordinary-user', 'branched']) {
   }));
 }
 
+for (const mode of ['unique-call', 'explicit-source', 'other-agent', 'parent-owns-call']) {
+  test(`active orphan result metadata tail: ${mode}`, () => fixture(async f => {
+    const u = turn('user', 'question'), a = batch('a', u, 'batch', [call('a')]), other = batch('other', u, 'other', [call('a')]);
+    const bridge = mode === 'parent-owns-call' ? turn('assistant', [call('a')], a.uuid) : turn('user', 'context', a.uuid, { isMeta: true });
+    const r = result('result', bridge, 'a'), meta = turn('user', 'notification', r.uuid, { isMeta: true }), done = batch('done', r, 'done');
+    if (mode === 'explicit-source' || mode === 'parent-owns-call') r.sourceToolAssistantUUID = a.uuid;
+    if (mode === 'other-agent') r.agentId = 'other';
+    f.conversation([u, a, ...(mode === 'explicit-source' ? [other] : []), bridge, r, meta, done]);
+    const read = await f.read('--events', '--tail', '0'), restored = ['unique-call', 'explicit-source'].includes(mode);
+    expect(read.data.messages.map(row => row.id)).toEqual([u, a, bridge, r, ...(restored ? [meta] : []), done].map(row => row.uuid));
+    expect(read.data.ancestryIncomplete).toBe(false); expect(f.connections()).toBe(0);
+    if (restored) expect((await f.read('--events', '--after', meta.uuid)).data.messages.map(row => row.id)).toEqual([done.uuid]);
+  }));
+}
+
 test('batch recovery cannot revive messages removed by compaction', () => fixture(async f => {
   const u = turn('user', 'old question'), old = batch('old block', u), c = boundary(), summary = turn('user', 'summary', c.uuid, { isCompactSummary: true }), current = batch('current block', summary);
   f.conversation([u, old, c, summary, current]);

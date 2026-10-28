@@ -165,7 +165,15 @@ function recoverBatches(nodes,branch,warnings) {
           if(effective.has(parent.uuid))effective.set(row.uuid,Math.max(order.get(row.uuid),rank(parent)));
         }
       };
-      for(const row of [...members,...toolResults.filter(row=>seen.has(row.uuid)&&memberIds.has(row.parentUuid)),...recovered.filter(row=>results(row).length)])addTails(row,recovered);
+      const linkedResults=toolResults.filter(row=>{
+        if(!seen.has(row.uuid))return false;if(memberIds.has(row.parentUuid))return true;
+        const parent=nodes.get(row.parentUuid),parentCalls=parent?calls(parent):[];
+        if(results(row).every(call=>parentCalls.includes(call)))return false;
+        const source=nodes.get(row.sourceToolAssistantUUID);
+        return source&&memberIds.has(source.uuid)&&sameAgent(row,source)||results(row).some(call=>{const owner=owners.get(call);return owner&&memberIds.has(owner.uuid)&&sameAgent(row,owner);});
+      });
+      // Already-active results can point through metadata; their associated tails still belong to the tool batch.
+      for(const row of [...members,...linkedResults])addTails(row,recovered);
       for(const row of branch.slice(start+1,end))if(metadata(row)){const additions=[];addTails(row,additions);if(additions.length)anchored.set(row.uuid,additions);}
     }
     if(recovered.length||anchored.size)plans.push({start,end,recovered:recovered.sort(compare),anchored});
