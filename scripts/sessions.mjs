@@ -287,7 +287,8 @@ async function main() {
     let context={};try{const c=await conversation(row.sessionId),last=c.messages.at(-1);context={source:c.source,lastMessage:last?{...last,text:last.text.slice(0,500),truncated:last.text.length>500}:null,latestUser:c.messages.findLast(m=>m.role==='user')?.text.slice(0,300),ancestryIncomplete:c.ancestryIncomplete,transcriptWarnings:c.warnings};}catch(e){context={transcriptError:e.code||e.message}}
     sessions.push({id:row.sessionId,pid:row.pid,name:row.name||null,cwd:row.cwd,status:row.status||'unknown',statusUpdatedAt:row.statusUpdatedAt||null,waitingFor:row.waitingFor||null,version:row.version,processIdentity:row.processIdentity,socket:row.messagingSocketPath||null,...context});
   }
-  return {capturedAt:new Date().toISOString(),configDir:root,sessions,warnings};
+  const verified=sessions.filter(s=>s.processIdentity==='verified').length;
+  return {capturedAt:new Date().toISOString(),configDir:root,counts:{verified,unverified:sessions.length-verified},sessions,warnings};
 }
 try {
   ({values:args,positionals}=parseArgs({args:process.argv.slice(2),options,allowPositionals:true}));

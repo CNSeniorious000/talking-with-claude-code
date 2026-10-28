@@ -1,6 +1,6 @@
 ---
 name: claude-code-sessions
-description: Inspect and message local Claude Code sessions with shell commands and a bundled Bun CLI. Use when asked what sessions are doing, to read their context, or send a question, finding, or handoff to a specific session.
+description: Read or message local Claude Code sessions from any agent via shell and a bundled Bun CLI. Use for Claude session activity, context, questions or handoffs; not for Codex or web chat history.
 license: MIT
 compatibility: Bun, macOS or Linux, and local Claude Code session files. Sending requires Claude Code's native inbox socket.
 metadata:
@@ -19,7 +19,7 @@ bun <skill-dir>/scripts/sessions.mjs send --id <session-uuid> --pid <pid> --text
 MESSAGE
 ```
 
-- `list` reads live registrations and conversation previews without connecting to sockets. Match by project, context, UUID and PID; names alone are not unique. `read` also accepts a saved session UUID.
+- `list` reads registrations and conversation previews without connecting to sockets. `counts.verified` counts confirmed live processes; keep unverified registrations separate and include every verified session in an overview. Match by project, context, UUID and PID; names alone are not unique. `read` also accepts a saved session UUID.
 - `read` returns the active conversation in branch order. Use `--before <message-uuid>` to page backward, `--after <message-uuid>` for subsequent messages, `--tail 0` for all, and `--max-chars 24000` for a larger text budget. `--events` includes tool results and agent notifications. Check truncation, warnings and `ancestryIncomplete` before claiming complete context.
 - `send` requires the exact UUID and PID from a fresh listing. It rechecks process start time, registration and socket ownership before writing. Use stdin for multiline or shell-sensitive text. Stdin keeps final newlines; quoted heredocs add one. Pipe an exact UTF-8 file when the text must match exactly. There is no broadcast, name-based send or automatic retry.
 - All commands emit JSON. `CLAUDE_CONFIG_DIR` or `--config-dir <path>` selects a different Claude data directory; otherwise use `~/.claude`.

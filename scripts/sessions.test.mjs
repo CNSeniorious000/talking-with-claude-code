@@ -54,6 +54,7 @@ test('list and read inspect the owned live PID without connecting to its inbox',
   f.conversation([request, reply]);
   const listed = await f.run(['list']), read = await f.read();
   expect(listed.code).toBe(0); expect(listed.data.sessions).toHaveLength(1);
+  expect(listed.data.counts).toEqual({ verified: 1, unverified: 0 });
   expect(listed.data.sessions[0]).toMatchObject({ id: f.id, pid: process.pid, processIdentity: 'verified', latestUser: request.message.content });
   expect(read.data.messages.map(row => row.text)).toEqual(['Review this branch', 'Still reviewing']);
   expect(f.connections()).toBe(0);
@@ -63,6 +64,7 @@ test('a stale process start identity blocks sending before connection', () => fi
   f.registration({ procStart: 'stale' });
   const result = await f.send();
   expect(result.code).toBe(1); expect(result.data.error).toBe('process_changed'); expect(f.connections()).toBe(0);
+  expect((await f.run(['list'])).data.counts).toEqual({ verified: 0, unverified: 1 });
 }));
 
 test('a session UUID mismatch blocks sending before connection', () => fixture(async f => {
