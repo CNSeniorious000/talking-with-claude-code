@@ -30,4 +30,4 @@ A successful socket write means **submitted**, not accepted, read or completed. 
 
 `processIdentity: "verified"` means the registered process is alive; `"unverified"` does not. A held message, old transcript, idle status or unusable socket does not make a verified process dead. Keep process liveness, delivery readiness and task progress separate. A past “CI passed” is not a fresh GitHub check. Report the latest request, progress, unresolved point, and evidence timestamp.
 
-Only local same-user sessions are supported. Registry and wire formats are Claude implementation details; missing identity fields or incompatible versions fail closed. Do not send fixtures or eval prompts to real working sessions.
+Only local same-user sessions are supported. Registry and wire formats are Claude implementation details. Missing identity fields block sending; an incompatible inbox may reject submitted bytes. Native messaging was verified with Claude Code 2.1.312. Do not send fixtures or eval prompts to real working sessions.
