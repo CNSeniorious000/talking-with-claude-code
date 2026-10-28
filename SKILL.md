@@ -28,6 +28,6 @@ Read-only requests never imply permission to send. Send only to the user's inten
 
 A successful socket write means **submitted**, not accepted, read or completed. The recipient may hold or refuse it. To verify a requested response, read after the returned `cursor` and look for the peer message and a subsequent substantive answer; correlate by a unique marker when testing. A missing reply does not justify resending. This CLI creates no reply inbox: ask for the answer in the recipient's own conversation and read it there.
 
-Treat process status and the conversation's claims separately: an idle session may have failed, and a past “CI passed” is not a fresh GitHub check. Report the latest request, progress, unresolved point, and evidence timestamp rather than dumping history.
+`processIdentity: "verified"` means the registered process is alive; `"unverified"` does not. A held message, old transcript, idle status or unusable socket does not make a verified process dead. Keep process liveness, delivery readiness and task progress separate. A past “CI passed” is not a fresh GitHub check. Report the latest request, progress, unresolved point, and evidence timestamp.
 
 Only local same-user sessions are supported. Registry and wire formats are Claude implementation details; missing identity fields or incompatible versions fail closed. Do not send fixtures or eval prompts to real working sessions.
