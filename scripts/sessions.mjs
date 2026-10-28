@@ -256,18 +256,20 @@ async function send() {
   if(payload.length>1000000)fail('message_too_large','Serialized message exceeds 1,000,000 characters');
   let cursor=null;try{cursor=(await conversation(id,true)).messages.at(-1)?.id||null}catch(e){if(e.code!=='transcript_missing')throw e}
   await new Promise((resolve,reject)=>{
-    let submitted=false;
+    let submitted=false,attempted=false;
     const client=createConnection({path:socket.path},()=>{
       try {
         // Discovery is a snapshot. Revalidate after connect, before any bytes leave.
         const current=readRegistration(file),now=socketIdentity(current);
         if(current.sessionId!==id||current.procStart!==row.procStart||now.path!==socket.path||now.ino!==socket.ino||now.dev!==socket.dev)fail('target_changed','Session or socket changed; nothing sent');
-        client.end(payload,()=>{submitted=true;});
+        attempted=true;
+        // Bun can finish end(data) after a short write. Flush explicitly and check its byte count before closing.
+        client.write(payload,error=>{if(error||client.bytesWritten<Buffer.byteLength(payload)){client.destroy(error||new Failure('outcome_unknown','Write interrupted; inspect the recipient before retrying'));return;}submitted=true;client.end();});
       }catch(e){client.destroy(e)}
     });
-    client.setTimeout(5000,()=>client.destroy(new Failure(submitted?'outcome_unknown':'socket_timeout',submitted?'Bytes were written but the connection did not close; inspect the recipient before retrying':'Socket timed out')));
-    client.on('error',e=>reject(submitted?new Failure('outcome_unknown','Connection failed after writing; inspect the recipient before retrying'):e));
-    client.on('data',()=>{});client.on('close',error=>{if(!error){if(submitted)resolve();else reject(new Failure('not_submitted','Connection closed before write completed'));}});
+    client.setTimeout(5000,()=>client.destroy(new Failure(attempted?'outcome_unknown':'socket_timeout',attempted?'Bytes may have been written; inspect the recipient before retrying':'Socket timed out')));
+    client.on('error',e=>reject(attempted?new Failure('outcome_unknown','Connection failed after a write attempt; inspect the recipient before retrying'):e));
+    client.on('data',()=>{});client.on('close',error=>{if(!error){if(submitted)resolve();else reject(new Failure(attempted?'outcome_unknown':'not_submitted','Connection closed before write completed; inspect the recipient before retrying'));}});
   });
   return {status:'submitted',acceptance:'unconfirmed',sessionId:id,pid,messageId:msgId,cursor,sentAt:new Date().toISOString(),note:'Read the recipient transcript to verify receipt or completion. Do not infer either from this write.'};
 }

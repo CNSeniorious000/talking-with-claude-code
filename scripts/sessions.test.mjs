@@ -11,7 +11,7 @@ const procStart = procStat === null ? execFileSync('/bin/ps', ['-p', String(proc
 const turn = (type, text, parentUuid = null, extra = {}) => ({ type, uuid: randomUUID(), parentUuid, timestamp: new Date().toISOString(), message: { role: type, content: text }, ...extra });
 const boundary = (compactMetadata = {}) => ({ type: 'system', subtype: 'compact_boundary', uuid: randomUUID(), parentUuid: null, compactMetadata });
 
-async function fixture(check) {
+async function fixture(check, { onData } = {}) {
   // A short path avoids macOS's Unix socket path limit; never inspect ~/.claude.
   const root = mkdtempSync('/tmp/ccs-test-'), id = randomUUID(), peers = new Set(), received = [];
   chmodSync(root, 0o700);
@@ -20,7 +20,7 @@ async function fixture(check) {
   let connections = 0;
   const server = createServer({ allowHalfOpen: true }, socket => {
     connections++; peers.add(socket); socket.setEncoding('utf8'); let text = '';
-    socket.on('data', chunk => { text += chunk; });
+    socket.on('data', chunk => { text += chunk; onData?.(socket, chunk); });
     socket.on('end', () => { received.push(text); socket.end(); });
     socket.on('error', () => {}); socket.on('close', () => peers.delete(socket));
   });
@@ -111,6 +111,21 @@ test('stdin preserves multiline content and a socket write never claims acceptan
   expect(payload).toMatchObject({ type: 'user', session_id: f.id, uuid: result.data.messageId, msg_id: result.data.messageId, message: { role: 'user', content: text } });
   expect(f.received[0].endsWith('\n')).toBe(true); expect(readFileSync(f.transcript, 'utf8')).toBe(before);
 }));
+
+test('a large Unicode message is flushed completely before submission is reported', () => fixture(async f => {
+  const text = '汉😀'.repeat(50000), result = await f.send(text);
+  expect(result.code).toBe(0); expect(result.data.status).toBe('submitted');
+  expect(f.received).toHaveLength(1); expect(JSON.parse(f.received[0]).message.content).toBe(text);
+}));
+
+test('a disconnect during a write reports an unknown outcome instead of safe failure or submission', async () => {
+  let bytes = 0;
+  await fixture(async f => {
+    const result = await f.send('x'.repeat(900000));
+    expect(bytes).toBeGreaterThan(0); expect(bytes).toBeLessThan(900000);
+    expect(result.code).toBe(1); expect(result.data.error).toBe('outcome_unknown'); expect(f.connections()).toBe(1);
+  }, { onData(socket, chunk) { bytes += Buffer.byteLength(chunk); socket.destroy(); } });
+});
 
 test('read follows the active branch and excludes its superseded answer', () => fixture(async f => {
   const request = turn('user', 'Start'), stale = turn('assistant', 'Superseded', request.uuid), active = turn('assistant', 'Corrected', request.uuid);
