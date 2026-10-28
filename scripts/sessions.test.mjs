@@ -217,3 +217,58 @@ for (const args of [['read', '--unknown'], ['read', '--id'], ['read', '--events=
     expect(result.code).toBe(1); expect(typeof result.data.error).toBe('string'); expect(typeof result.data.message).toBe('string'); expect(f.connections()).toBe(0);
   }));
 }
+
+const batch = (text, parent, id = 'batch', content = text) => turn('assistant', content, parent.uuid, { message: { role: 'assistant', id, content } });
+const call = id => ({ type: 'tool_use', id, name: 'Read', input: { file_path: 'fixture' } });
+const result = (text, parent, id) => turn('user', [{ type: 'tool_result', tool_use_id: id, content: text }], parent.uuid);
+test('sibling response blocks preserve the selected anchor and support pagination', () => fixture(async f => {
+  const u = turn('user', 'question'), a = batch('first written', u), b = batch('selected anchor', u); f.conversation([u, a, b]);
+  const read = await f.read('--tail', '0'), after = await f.read('--after', b.uuid);
+  expect(read.data.messages.map(row => row.text)).toEqual(['question', 'selected anchor', 'first written']);
+  expect(after.data.messages.map(row => row.id)).toEqual([a.uuid]); expect(read.data.ancestryIncomplete).toBe(false);
+}));
+
+test('recovered blocks stay before the next user turn without reviving other responses', () => fixture(async f => {
+  const u = turn('user', 'question'), old = batch('abandoned', u, 'old'), a = batch('first', u), next = turn('user', 'next question', a.uuid), done = batch('next answer', next, 'next'), b = batch('sibling', u);
+  f.conversation([u, old, a, next, done, b, checkpoint(done.uuid)]);
+  const read = await f.read('--tail', '0');
+  expect(read.data.messages.map(row => row.text)).toEqual(['question', 'first', 'sibling', 'next question', 'next answer']);
+}));
+
+test('parallel tool blocks restore their associated results in native anchor order', () => fixture(async f => {
+  const u = turn('user', 'question'), a = batch('a', u, 'batch', [call('a')]), b = batch('b', u, 'batch', [call('b')]), ra = result('ra', a, 'a'), rb = result('rb', b, 'b'), done = batch('done', rb, 'done');
+  f.conversation([u, a, b, ra, rb, done]);
+  const read = await f.read('--events', '--tail', '0');
+  expect(read.data.messages.map(row => row.id)).toEqual([u, b, a, ra, rb, done].map(row => row.uuid));
+}));
+
+for (const mode of ['unique', 'ambiguous', 'different-parent', 'sidechain', 'other-agent', 'already-present']) {
+  test(`orphan tool result recovery: ${mode}`, () => fixture(async f => {
+    const u = turn('user', 'question'), a = batch('a', u, 'batch', [call('a')]), orphan = result('orphan', u, 'a'), direct = result('direct', a, 'a'), other = batch('other', u, 'other', [call('a')]);
+    if (mode === 'sidechain') orphan.isSidechain = true;
+    if (mode === 'other-agent') orphan.agentId = 'other';
+    if (mode === 'different-parent') { delete other.message.id; orphan.parentUuid = other.uuid; }
+    const done = batch('done', mode === 'already-present' ? direct : a, 'done');
+    f.conversation([u, orphan, a, ...(['ambiguous', 'different-parent'].includes(mode) ? [other] : []), ...(mode === 'already-present' ? [direct] : []), done]);
+    const read = await f.read('--events', '--tail', '0');
+    const expected = [u, a, ...(mode === 'unique' ? [orphan] : mode === 'already-present' ? [direct] : []), done];
+    expect(read.data.messages.map(row => row.id)).toEqual(expected.map(row => row.uuid)); expect(read.data.ancestryIncomplete).toBe(false);
+  }));
+}
+
+for (const mode of ['linear', 'ordinary-user', 'branched']) {
+  test(`metadata tail recovery: ${mode}`, () => fixture(async f => {
+    const u = turn('user', 'question'), a = batch('a', u, 'batch', [call('a')]), b = batch('b', u, 'batch', [call('b')]), r = result('result', a, 'a');
+    const meta = turn('user', 'notification', r.uuid, { isMeta: true }), next = turn('user', 'abandoned next turn', meta.uuid), x = turn('user', 'x', meta.uuid, { isMeta: true }), y = turn('user', 'y', meta.uuid, { isMeta: true }), done = batch('done', b, 'done');
+    f.conversation([u, a, b, r, meta, ...(mode === 'ordinary-user' ? [next] : mode === 'branched' ? [x, y] : []), done]);
+    const read = await f.read('--events', '--tail', '0'), expected = [u, b, a, r, ...(mode === 'linear' ? [meta] : []), done];
+    expect(read.data.messages.map(row => row.id)).toEqual(expected.map(row => row.uuid));
+  }));
+}
+
+test('batch recovery cannot revive messages removed by compaction', () => fixture(async f => {
+  const u = turn('user', 'old question'), old = batch('old block', u), c = boundary(), summary = turn('user', 'summary', c.uuid, { isCompactSummary: true }), current = batch('current block', summary);
+  f.conversation([u, old, c, summary, current]);
+  const read = await f.read('--tail', '0');
+  expect(read.data.messages.map(row => row.text)).toEqual(['summary', 'current block']);
+}));

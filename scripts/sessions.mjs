@@ -113,6 +113,83 @@ function currentLeaf(records,nodes,compact) {
   // Rewinds pin an existing branch. A later sibling or metadata snapshot must not undo that choice.
   return selected;
 }
+function recoverBatches(nodes,branch,warnings) {
+  const rows=[...nodes.values()],order=new Map(rows.map((row,i)=>[row.uuid,i])),positions=new Map(branch.map((row,i)=>[row.uuid,i]));
+  const blocks=(row,type,key)=>Array.isArray(row.message?.content)?row.message.content.filter(b=>b.type===type&&typeof b[key]==='string').map(b=>b[key]):[];
+  const calls=row=>row.type==='assistant'?blocks(row,'tool_use','id'):[],results=row=>row.type==='user'?blocks(row,'tool_result','tool_use_id'):[];
+  const metadata=row=>row.type==='attachment'||row.type==='system'&&row.subtype!=='compact_boundary'||row.type==='user'&&row.isMeta===true&&!results(row).length;
+  const inBatch=(row,id)=>row.type==='assistant'?row.message?.id===id:metadata(row)||row.type==='user'&&results(row).length>0;
+  const sameAgent=(a,b)=>(a.isSidechain??false)===(b.isSidechain??false)&&a.agentId===b.agentId;
+  const groups=new Map(),owners=new Map(),children=new Map(),toolResults=rows.filter(row=>results(row).length),seen=new Set(branch.map(row=>row.uuid));
+  for(const row of rows) {
+    if(row.parentUuid){const list=children.get(row.parentUuid)||[];list.push(row);children.set(row.parentUuid,list);}
+    if(row.type!=='assistant'||!row.message?.id)continue;
+    const id=row.message.id,list=groups.get(id)||[];list.push(row);groups.set(id,list);
+    for(const call of calls(row)){const previous=owners.get(call);owners.set(call,previous===undefined||previous?.message.id===id?row:null);}
+  }
+  const represented=new Set(branch.flatMap(results)),effective=new Map(),processed=new Set(),plans=[];
+  const rank=row=>effective.get(row.uuid)??order.get(row.uuid),compare=(a,b)=>rank(a)-rank(b)||order.get(a.uuid)-order.get(b.uuid);
+  let incomplete=false;
+  const tail=(first,parent)=>{
+    const chain=[],visited=new Set();let node=first;
+    while(node){
+      if(visited.has(node.uuid)){incomplete=true;warnings.push('A metadata tail contains a cycle');return [];}
+      if(seen.has(node.uuid)||node.isSidechain!==parent.isSidechain||!metadata(node))return [];
+      visited.add(node.uuid);chain.push(node);const next=(children.get(node.uuid)||[]).filter(row=>!seen.has(row.uuid));
+      if(next.length>1)return [];node=next[0];
+    }
+    return chain;
+  };
+  for(let start=0;start<branch.length;start++){
+    const anchor=branch[start],id=anchor.type==='assistant'&&anchor.message?.id;
+    if(!id||processed.has(id))continue;processed.add(id);
+    const members=groups.get(id)||[anchor],memberIds=new Set(members.map(row=>row.uuid));
+    const recovered=members.filter(row=>!seen.has(row.uuid)),direct=toolResults.filter(row=>!seen.has(row.uuid)&&memberIds.has(row.parentUuid));
+    recovered.push(...direct);for(const row of direct)for(const call of results(row))represented.add(call);
+    const lastMember=Math.max(...members.map(row=>order.get(row.uuid)));
+    for(const row of toolResults){
+      if(seen.has(row.uuid)||memberIds.has(row.parentUuid))continue;
+      const parent=nodes.get(row.parentUuid),parentCalls=parent?calls(parent):[];
+      if(results(row).every(call=>parentCalls.includes(call)))continue;
+      if(!results(row).some(call=>{const owner=owners.get(call);return owner&&memberIds.has(owner.uuid)&&sameAgent(row,owner)&&!represented.has(call);}))continue;
+      for(const call of results(row))represented.add(call);effective.set(row.uuid,Math.max(order.get(row.uuid),lastMember+0.5));recovered.push(row);
+    }
+    for(const row of recovered)seen.add(row.uuid);
+    let end=Math.max(start+1,...members.map(row=>(positions.get(row.uuid)??-1)+1));
+    while(end<branch.length&&inBatch(branch[end],id))end++;
+    const anchored=new Map();
+    if(members.some(row=>calls(row).length)){
+      const addTails=(parent,target)=>{
+        for(const child of children.get(parent.uuid)||[])for(const row of tail(child,parent)){
+          seen.add(row.uuid);target.push(row);
+          if(effective.has(parent.uuid))effective.set(row.uuid,Math.max(order.get(row.uuid),rank(parent)));
+        }
+      };
+      for(const row of [...members,...toolResults.filter(row=>seen.has(row.uuid)&&memberIds.has(row.parentUuid)),...recovered.filter(row=>results(row).length)])addTails(row,recovered);
+      for(const row of branch.slice(start+1,end))if(metadata(row)){const additions=[];addTails(row,additions);if(additions.length)anchored.set(row.uuid,additions);}
+    }
+    if(recovered.length||anchored.size)plans.push({start,end,recovered:recovered.sort(compare),anchored});
+  }
+  const merged=[];
+  for(const plan of plans){
+    const previous=merged.at(-1);
+    if(previous&&plan.start<previous.end){
+      previous.end=Math.max(previous.end,plan.end);previous.recovered.push(...plan.recovered);previous.recovered.sort(compare);
+      for(const [id,rows] of plan.anchored)previous.anchored.set(id,[...previous.anchored.get(id)||[],...rows]);
+    }else merged.push(plan);
+  }
+  const restored=[];let offset=0;
+  for(const plan of merged){
+    // Keep the chosen chain's anchor first, even when a recovered sibling was written earlier.
+    restored.push(...branch.slice(offset,plan.start+1));let index=0;
+    for(let i=plan.start+1;i<plan.end;i++){
+      while(index<plan.recovered.length&&rank(plan.recovered[index])<order.get(branch[i].uuid))restored.push(plan.recovered[index++]);
+      restored.push(branch[i],...plan.anchored.get(branch[i].uuid)||[]);
+    }
+    restored.push(...plan.recovered.slice(index));offset=plan.end;
+  }
+  return {branch:[...restored,...branch.slice(offset)],incomplete};
+}
 async function conversation(id,events=false) {
   const file=await transcriptPath(id),records=[],warnings=[];
   let line=0;
@@ -129,6 +206,7 @@ async function conversation(id,events=false) {
     while(node){ if(visited.has(node.uuid)){ancestryIncomplete=true;warnings.push('Conversation ancestry contains a cycle');break} visited.add(node.uuid);chain.push(node);if(!node.parentUuid)break;const parent=nodes.get(node.parentUuid);if(!parent){ancestryIncomplete=true;break}node=parent; }
     branch=chain.reverse();
   }
+  const recovered=recoverBatches(nodes,branch,warnings);branch=recovered.branch;ancestryIncomplete ||= recovered.incomplete;
   const messages=branch.flatMap(r=>{
     if(!['user','assistant'].includes(r.type)||r.isSidechain)return [];
     const text=content(r,events);if(!text)return [];
