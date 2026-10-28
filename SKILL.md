@@ -20,7 +20,7 @@ MESSAGE
 ```
 
 - `list` reads live registrations and conversation previews without connecting to sockets. Match by project, context, UUID and PID; names alone are not unique. `read` also accepts a saved session UUID.
-- `read` returns the current conversation branch, oldest first. Use `--before <message-uuid>` to page backward, `--after <message-uuid>` for subsequent messages, `--tail 0` for all, and `--max-chars 24000` for a larger text budget. `--events` includes tool results and agent notifications. It reports truncation and source paths.
+- `read` returns the active conversation in branch order. Use `--before <message-uuid>` to page backward, `--after <message-uuid>` for subsequent messages, `--tail 0` for all, and `--max-chars 24000` for a larger text budget. `--events` includes tool results and agent notifications. Check truncation, warnings and `ancestryIncomplete` before claiming complete context.
 - `send` requires the exact UUID and PID from a fresh listing. It rechecks process start time, registration and socket ownership before writing. Use stdin for multiline or shell-sensitive text. There is no broadcast, name-based send or automatic retry.
 - All commands emit JSON. `CLAUDE_CONFIG_DIR` or `--config-dir <path>` selects a different Claude data directory; otherwise use `~/.claude`.
 
