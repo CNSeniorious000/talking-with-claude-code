@@ -164,3 +164,56 @@ test('partial JSON writes produce warnings and the text budget keeps the newest 
   expect(result.data.truncated).toBe(true); expect(result.data.availableMessages).toBe(2);
   expect(result.data.messages).toHaveLength(1); expect(result.data.messages[0]).toMatchObject({ id: b.uuid, text: 'Newest', truncated: true });
 }));
+
+const checkpoint = leafUuid => ({ type: 'last-prompt', leafUuid, explicit: true, rewound: true });
+for (const [name, arrange, texts] of [
+  ['explicit rewind', (a, b) => [a, b, checkpoint(a.uuid)], ['request']],
+  ['explicit clear', (a, b) => [a, b, checkpoint(null)], []],
+  ['clear followed by a sidechain', (a, b) => [a, b, checkpoint(null), turn('assistant', 'subagent', b.uuid, { isSidechain: true })], []],
+  ['clear followed by a new main turn', (a, b) => [a, b, checkpoint(null), turn('user', 'fresh')], ['fresh']],
+  ['rewind followed by a descendant', (a, b) => [a, b, checkpoint(a.uuid), turn('assistant', 'new answer', a.uuid)], ['request', 'new answer']],
+  ['checkpoint followed by a sibling', (a, b) => [a, b, checkpoint(b.uuid), turn('assistant', 'other branch', a.uuid)], ['request', 'answer']],
+  ['checkpoint replaced by another checkpoint', (a, b) => [a, b, checkpoint(a.uuid), checkpoint(b.uuid)], ['request', 'answer']],
+  ['rewind followed by metadata snapshots', (a, b) => [a, b, checkpoint(a.uuid), { type: 'file-history-snapshot', messageId: b.uuid, snapshot: {} }, { type: 'last-prompt', lastPrompt: 'preview' }], ['request']],
+]) test(name, () => fixture(async f => {
+  const a = turn('user', 'request'), b = turn('assistant', 'answer', a.uuid);
+  f.conversation(arrange(a, b).map(row => ({ sessionId: f.id, ...row })));
+  const result = await f.read('--tail', '0');
+  expect(result.code).toBe(0); expect(result.data.messages.map(row => row.text)).toEqual(texts); expect(result.data.ancestryIncomplete).toBe(false);
+}));
+
+test('non-preserving compaction clears old context even before its summary is written', () => fixture(async f => {
+  const a = turn('user', 'old request'), c = boundary();
+  f.conversation([a, checkpoint(a.uuid), c]);
+  const result = await f.read('--tail', '0');
+  expect(result.code).toBe(0); expect(result.data.messages).toEqual([]); expect(result.data.ancestryIncomplete).toBe(false);
+}));
+
+test('an explicit checkpoint overrides the preserved compaction tail', () => fixture(async f => {
+  const a = turn('user', 'request'), b = turn('assistant', 'answer', a.uuid), c = boundary();
+  c.compactMetadata.preservedMessages = { anchorUuid: c.uuid, uuids: [a.uuid, b.uuid] };
+  f.conversation([a, b, c, checkpoint(a.uuid)]);
+  const result = await f.read('--tail', '0');
+  expect(result.code).toBe(0); expect(result.data.messages.map(row => row.id)).toEqual([a.uuid]);
+}));
+
+test('an appended UUID revision updates both content and active branch choice', () => fixture(async f => {
+  const a = turn('user', 'request'), b = turn('assistant', 'draft', a.uuid), other = turn('assistant', 'other branch', a.uuid);
+  const revision = { ...b, message: { role: 'assistant', content: 'final answer' } };
+  f.conversation([a, b, other, revision]);
+  const result = await f.read('--tail', '0');
+  expect(result.code).toBe(0); expect(result.data.messages.map(row => row.text)).toEqual(['request', 'final answer']);
+}));
+
+test('cycles report incomplete ancestry instead of appearing complete', () => fixture(async f => {
+  const a = turn('user', 'request'), b = turn('assistant', 'answer', a.uuid); a.parentUuid = b.uuid; f.conversation([a, b]);
+  const result = await f.read();
+  expect(result.code).toBe(0); expect(result.data.ancestryIncomplete).toBe(true); expect(result.data.warnings.some(w => w.includes('cycle'))).toBe(true);
+}));
+
+for (const args of [['read', '--unknown'], ['read', '--id'], ['read', '--events=false']]) {
+  test(`invalid arguments remain JSON: ${args.join(' ')}`, () => fixture(async f => {
+    const result = await f.run(args);
+    expect(result.code).toBe(1); expect(typeof result.data.error).toBe('string'); expect(typeof result.data.message).toBe('string'); expect(f.connections()).toBe(0);
+  }));
+}

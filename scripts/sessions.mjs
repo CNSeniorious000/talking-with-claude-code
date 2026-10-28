@@ -15,8 +15,7 @@ const fail = (code, message) => { throw new Failure(code, message); };
 const missing = e => e.code === 'ENOENT' || e.code === 'ESRCH';
 const normalize = s => String(s).trim().replace(/\s+/g, ' ');
 const options = {id:{type:'string'},pid:{type:'string'},text:{type:'string'},tail:{type:'string'},'max-chars':{type:'string'},before:{type:'string'},after:{type:'string'},events:{type:'boolean'},'config-dir':{type:'string'},help:{type:'boolean'}};
-const {values:args,positionals} = parseArgs({args:process.argv.slice(2),options,allowPositionals:true});
-const command = positionals[0], root = resolve(args['config-dir'] || process.env.CLAUDE_CONFIG_DIR || join(homedir(),'.claude'));
+let args,positionals,command,root;
 const number = (name, fallback, max) => { const value=args[name]===undefined?fallback:Number(args[name]); if(!Number.isSafeInteger(value)||value<0||value>max)fail('invalid_argument',`--${name} must be an integer between 0 and ${max}`); return value; };
 function sessionId() { if(!UUID.test(args.id||''))fail('invalid_argument','--id requires a full session UUID'); return args.id; }
 function readRegistration(file) {
@@ -66,7 +65,7 @@ function content(row,events) {
 }
 function relinkCompaction(nodes,warnings) {
   const entries=[...nodes.values()], boundaries=entries.filter(r=>r.type==='system'&&r.subtype==='compact_boundary');
-  if(!boundaries.some(r=>r.compactMetadata?.preservedMessages||r.compactMetadata?.preservedSegment))return {};
+  if(!boundaries.length)return {};
   const boundary=boundaries.at(-1),meta=boundary.compactMetadata||{},cut=entries.indexOf(boundary);
   let kept=meta.preservedMessages;
   if(!kept&&meta.preservedSegment){
@@ -90,6 +89,30 @@ function relinkCompaction(nodes,warnings) {
   if(ids.length)for(const [id,node] of nodes)if(['user','assistant'].includes(node.type)&&removed.has(node.parentUuid))nodes.set(id,{...node,parentUuid:ids.at(-1)});
   return {tail:ids.at(-1),boundary:boundary.uuid};
 }
+function currentLeaf(records,nodes,compact) {
+  let checkpoint,explicit=false,cleared=false,latest;
+  for(const row of records) {
+    if(row.type==='last-prompt'){
+      if(row.leafUuid){explicit=row.explicit===true||(explicit&&checkpoint===row.leafUuid);checkpoint=row.leafUuid;cleared=false;}
+      else if(row.leafUuid===null&&row.explicit===true){checkpoint=undefined;explicit=false;cleared=true;}
+      continue;
+    }
+    if(!['user','assistant','system','attachment'].includes(row.type)||!nodes.has(row.uuid))continue;
+    if(!row.isSidechain&&!(row.type==='attachment'&&row.attachment?.type==='fork_briefing')){latest=nodes.get(row.uuid);explicit=false;cleared=false;}
+    if(row.type==='system'&&row.subtype==='compact_boundary'){checkpoint=undefined;explicit=false;}
+  }
+  if(cleared)return;
+  const selected=nodes.get(checkpoint);
+  // Preserved turns retain their old file positions; the boundary itself is not their logical tail.
+  if(compact.tail&&!(explicit&&selected&&!selected.isSidechain))return latest?.uuid===compact.boundary?nodes.get(compact.tail):latest;
+  if(!selected)return latest;
+  if(!explicit&&latest){
+    const seen=new Set();let node=latest;
+    while(node&&!seen.has(node.uuid)){if(node.uuid===checkpoint)return latest;seen.add(node.uuid);node=nodes.get(node.parentUuid);}
+  }
+  // Rewinds pin an existing branch. A later sibling or metadata snapshot must not undo that choice.
+  return selected;
+}
 async function conversation(id,events=false) {
   const file=await transcriptPath(id),records=[],warnings=[];
   let line=0;
@@ -99,13 +122,11 @@ async function conversation(id,events=false) {
   }
   const nodes=new Map(records.filter(r=>r.uuid).map(r=>[r.uuid,r]));
   const compact=relinkCompaction(nodes,warnings);let ancestryIncomplete=!!compact.incomplete;
-  const after=compact.tail?records.slice(records.findIndex(r=>r.uuid===compact.boundary)+1):[...nodes.values()];
-  const leaf=after.findLast(r=>['user','assistant'].includes(r.type)&&r.uuid&&!r.isSidechain);
-  const last=nodes.get(leaf?.uuid||compact.tail);
-  let branch=[...nodes.values()];
+  const last=currentLeaf(records,nodes,compact);
+  let branch=[];
   if(last) {
     const chain=[],visited=new Set();let node=last;
-    while(node){ if(visited.has(node.uuid)){warnings.push('Conversation ancestry contains a cycle');break} visited.add(node.uuid);chain.push(node);if(!node.parentUuid)break;const parent=nodes.get(node.parentUuid);if(!parent){ancestryIncomplete=true;break}node=parent; }
+    while(node){ if(visited.has(node.uuid)){ancestryIncomplete=true;warnings.push('Conversation ancestry contains a cycle');break} visited.add(node.uuid);chain.push(node);if(!node.parentUuid)break;const parent=nodes.get(node.parentUuid);if(!parent){ancestryIncomplete=true;break}node=parent; }
     branch=chain.reverse();
   }
   const messages=branch.flatMap(r=>{
@@ -178,4 +199,8 @@ async function main() {
   }
   return {capturedAt:new Date().toISOString(),configDir:root,sessions,warnings};
 }
-try { console.log(JSON.stringify(await main(),null,2)); } catch(e) { console.error(JSON.stringify({error:e.code||'failed',message:e.message}));process.exitCode=1; }
+try {
+  ({values:args,positionals}=parseArgs({args:process.argv.slice(2),options,allowPositionals:true}));
+  command=positionals[0];root=resolve(args['config-dir']||process.env.CLAUDE_CONFIG_DIR||join(homedir(),'.claude'));
+  console.log(JSON.stringify(await main(),null,2));
+} catch(e) { console.error(JSON.stringify({error:e.code||'failed',message:e.message}));process.exitCode=1; }
