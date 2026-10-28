@@ -1,6 +1,6 @@
 ---
 name: claude-code-sessions
-description: Inspect and message local Claude Code sessions from any agent. Use when asked what other Claude sessions are doing, to recover their context or recent conversation, or to send a finding, question, or handoff to a specific running Claude session.
+description: Inspect and message local Claude Code sessions with shell commands and a bundled Bun CLI. Use when asked what sessions are doing, to read their context, or send a question, finding, or handoff to a specific session.
 license: MIT
 compatibility: Bun, macOS or Linux, and local Claude Code session files. Sending requires Claude Code's native inbox socket.
 metadata:
