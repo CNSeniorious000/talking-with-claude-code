@@ -1,0 +1,11 @@
+# claude-code-sessions
+
+One agent skill for inspecting and messaging local Claude Code sessions from Codex, OpenCode, or another coding agent. Uses Bun and Claude's native session registry, transcripts, and Unix inbox sockets.
+
+```sh
+bunx skills add CNSeniorious000/claude-code-sessions
+```
+
+See [SKILL.md](SKILL.md). No MCP server, Claude relay process, or runtime dependencies. macOS and Linux; native Windows and cross-machine delivery are not supported.
+
+A send confirms submission only. The receiving session's inbound policy still applies.
