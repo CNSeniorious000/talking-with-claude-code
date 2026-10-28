@@ -255,6 +255,7 @@ async function send() {
   const socket=socketIdentity(row),msgId=randomUUID(),payload=JSON.stringify({type:'user',session_id:id,uuid:msgId,msg_id:msgId,from:'external-agent',message:{role:'user',content:text}})+'\n';
   if(payload.length>1000000)fail('message_too_large','Serialized message exceeds 1,000,000 characters');
   let cursor=null;try{cursor=(await conversation(id,true)).messages.at(-1)?.id||null}catch(e){if(e.code!=='transcript_missing')throw e}
+  let deadline;
   await new Promise((resolve,reject)=>{
     let submitted=false,attempted=false;
     const client=createConnection({path:socket.path},()=>{
@@ -267,10 +268,11 @@ async function send() {
         client.write(payload,error=>{if(error||client.bytesWritten<Buffer.byteLength(payload)){client.destroy(error||new Failure('outcome_unknown','Write interrupted; inspect the recipient before retrying'));return;}submitted=true;client.end();});
       }catch(e){client.destroy(e)}
     });
-    client.setTimeout(5000,()=>client.destroy(new Failure(attempted?'outcome_unknown':'socket_timeout',attempted?'Bytes may have been written; inspect the recipient before retrying':'Socket timed out')));
+    // A half-closed, backpressured Bun socket may never emit its inactivity timeout or finish the write callback.
+    deadline=setTimeout(()=>{reject(new Failure(attempted?'outcome_unknown':'socket_timeout',attempted?'Bytes may have been written; inspect the recipient before retrying':'Socket timed out'));client.destroy();},5000);
     client.on('error',e=>reject(attempted?new Failure('outcome_unknown','Connection failed after a write attempt; inspect the recipient before retrying'):e));
     client.on('data',()=>{});client.on('close',error=>{if(!error){if(submitted)resolve();else reject(new Failure(attempted?'outcome_unknown':'not_submitted','Connection closed before write completed; inspect the recipient before retrying'));}});
-  });
+  }).finally(()=>clearTimeout(deadline));
   return {status:'submitted',acceptance:'unconfirmed',sessionId:id,pid,messageId:msgId,cursor,sentAt:new Date().toISOString(),note:'Read the recipient transcript to verify receipt or completion. Do not infer either from this write.'};
 }
 async function main() {

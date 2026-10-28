@@ -127,6 +127,15 @@ test('a disconnect during a write reports an unknown outcome instead of safe fai
   }, { onData(socket, chunk) { bytes += Buffer.byteLength(chunk); socket.destroy(); } });
 });
 
+test('a half-closed peer that stops reading cannot leave a write hanging', async () => {
+  let bytes = 0;
+  await fixture(async f => {
+    const result = await f.send('x'.repeat(900000));
+    expect(bytes).toBeGreaterThan(0); expect(bytes).toBeLessThan(900000);
+    expect(result.code).toBe(1); expect(result.data.error).toBe('outcome_unknown'); expect(f.connections()).toBe(1);
+  }, { onData(socket, chunk) { bytes += Buffer.byteLength(chunk); socket.pause(); socket.end(); } });
+}, 10000);
+
 test('read follows the active branch and excludes its superseded answer', () => fixture(async f => {
   const request = turn('user', 'Start'), stale = turn('assistant', 'Superseded', request.uuid), active = turn('assistant', 'Corrected', request.uuid);
   f.conversation([request, stale, active]);
