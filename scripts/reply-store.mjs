@@ -71,7 +71,7 @@ export async function receiveReply(request,validateTarget){
 }
 export async function waitReply(request,seconds){
   const {directory,data}=load(request);
-  const read=()=>existsSync(join(directory,'reply.json'))?privateFile(join(directory,'reply.json')):Date.now()>=Date.parse(data.expiresAt)?{status:'expired'}:undefined;
+  const read=()=>!existsSync(join(directory,'request.json'))?{status:'closed'}:existsSync(join(directory,'reply.json'))?privateFile(join(directory,'reply.json')):Date.now()>=Date.parse(data.expiresAt)?{status:'expired'}:undefined;
   const result=seconds?await observe(directory,read,Math.min(seconds,Math.max(0,(Date.parse(data.expiresAt)-Date.now())/1000))):read();
   const receipt=existsSync(join(directory,'receipt.json'))?privateFile(join(directory,'receipt.json')):null;
   return {request:join(directory,'request.json'),expiresAt:data.expiresAt,sessionId:data.row.sessionId,messageId:data.messageId,reply:result||{status:seconds?'timeout':'pending',...receipt&&{receipt}}};

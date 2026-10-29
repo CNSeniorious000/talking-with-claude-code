@@ -486,3 +486,10 @@ test('a post-submission wait error preserves the handle and receiver',async()=>{
     expect(recovered.data.reply.text).toBe('Recovered after wait error');expect(f.connections()).toBe(1);
   },{onMessage:()=>makeUnreadable()});
 });
+
+test('closing a request wakes its active waiter without resending',()=>fixture(async f=>{
+  const sent=await f.send('Await cancellation','--wait','0'),pending=f.run(['wait','--request',sent.data.request,'--timeout','3']);
+  await Bun.sleep(100);
+  expect((await f.run(['close','--request',sent.data.request])).code).toBe(0);
+  const stopped=await pending;expect(stopped.code).toBe(2);expect(['cancelled','closed']).toContain(stopped.data.reply.status);expect(f.connections()).toBe(1);
+}));
