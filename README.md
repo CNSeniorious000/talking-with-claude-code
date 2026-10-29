@@ -2,6 +2,9 @@
 
 One agent skill for inspecting and messaging local Claude Code sessions from Codex, OpenCode, or another coding agent. Uses Bun and Claude's native session registry, transcripts, and Unix inbox sockets.
 
+> [!NOTE]
+> `SendMessage` is a native Claude Code tool, but we have not found a publicly documented API with compatibility guarantees for external clients connecting to existing sessions. This skill uses a reverse-engineered internal socket protocol, verified with Claude Code 2.1.312; upgrades may change its format or behavior.
+
 ```sh
 bunx skills add CNSeniorious000/talking-with-claude-code
 ```
