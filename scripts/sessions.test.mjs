@@ -493,3 +493,22 @@ test('closing a request wakes its active waiter without resending',()=>fixture(a
   expect((await f.run(['close','--request',sent.data.request])).code).toBe(0);
   const stopped=await pending;expect(stopped.code).toBe(2);expect(['cancelled','closed']).toContain(stopped.data.reply.status);expect(f.connections()).toBe(1);
 }));
+
+for(const mode of ['bypass','prompting']){
+  test(`explicit sender mode uses native wrapper metadata: ${mode}`,()=>fixture(async f=>{
+    const result=await f.send('Permission-class test','--sender-mode',mode);
+    expect(result.code).toBe(0);
+    const frame=JSON.parse(f.received[0]);expect(frame.message.content).toBe(`<cross-session-message from-mode="${mode}">\nPermission-class test\n</cross-session-message>`);
+    expect(frame.msgV).toBe(1);expect(frame.session_id).toBe(f.id);expect(f.connections()).toBe(1);
+  }));
+}
+
+test('waiting does not implicitly attest a permission mode',()=>fixture(async f=>{
+  const result=await f.send('Unknown host mode','--wait','0'),frame=JSON.parse(f.received[0]);
+  expect(result.data.reply.status).toBe('pending');expect(frame.message.content).not.toContain('from-mode=');
+}));
+
+test('invalid sender mode is refused before any socket connection',()=>fixture(async f=>{
+  expect((await f.send('hello','--sender-mode','auto')).data.error).toBe('invalid_argument');
+  expect((await f.run(['list','--sender-mode','bypass'])).data.error).toBe('invalid_argument');expect(f.connections()).toBe(0);
+}));

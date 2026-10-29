@@ -16,7 +16,7 @@ class Failure extends Error { constructor(code, message) { super(message); this.
 const fail = (code, message) => { throw new Failure(code, message); };
 const missing = e => e.code === 'ENOENT' || e.code === 'ESRCH';
 const normalize = s => String(s).trim().replace(/\s+/g, ' ');
-const options = {id:{type:'string'},pid:{type:'string'},text:{type:'string'},wait:{type:'string'},request:{type:'string'},timeout:{type:'string'},'reply-ttl':{type:'string'},tail:{type:'string'},'max-chars':{type:'string'},before:{type:'string'},after:{type:'string'},events:{type:'boolean'},'config-dir':{type:'string'},help:{type:'boolean'}};
+const options = {id:{type:'string'},pid:{type:'string'},text:{type:'string'},wait:{type:'string'},request:{type:'string'},timeout:{type:'string'},'reply-ttl':{type:'string'},'sender-mode':{type:'string'},tail:{type:'string'},'max-chars':{type:'string'},before:{type:'string'},after:{type:'string'},events:{type:'boolean'},'config-dir':{type:'string'},help:{type:'boolean'}};
 let args,positionals,command,root;
 const number = (name, fallback, max) => { const value=args[name]===undefined?fallback:Number(args[name]); if(!Number.isSafeInteger(value)||value<0||value>max)fail('invalid_argument',`--${name} must be an integer between 0 and ${max}`); return value; };
 function sessionId() { if(!UUID.test(args.id||''))fail('invalid_argument','--id requires a full session UUID'); return args.id; }
@@ -255,6 +255,7 @@ function validateTarget(row,socket){
 async function send() {
   const id=sessionId(),pid=number('pid',0,2147483647);if(!pid)fail('invalid_argument','--pid is required; use the exact PID from a fresh list');
   if(args.text===undefined)fail('invalid_argument','--text is required; use --text - to read stdin');
+  const senderMode=args['sender-mode'];if(senderMode!==undefined&&!['bypass','prompting'].includes(senderMode))fail('invalid_argument','--sender-mode must be bypass or prompting');
   const text=args.text==='-'?await Bun.stdin.text():args.text;if(!text.trim())fail('invalid_argument','Message must not be empty');
   const file=join(root,'sessions',`${pid}.json`),row=readRegistration(file);
   if(row.sessionId!==id)fail('target_mismatch','UUID and PID do not refer to the same registered session');
@@ -265,8 +266,9 @@ async function send() {
   let sent=false;
   try{
   // Native origin.from is not shown to the model. An explicit wrapper makes its return address actionable.
-  const body=inbox?`<cross-session-message from="${inbox.address}">\n${text}\n\nReply using SendMessage to the from address above.\n</cross-session-message>`:text;
-  const payload=JSON.stringify({type:'user',session_id:id,uuid:msgId,msg_id:msgId,...inbox&&{msgV:1},from:inbox?.address||'external-agent',message:{role:'user',content:body}})+'\n';
+  const wrapped=!!inbox||senderMode!==undefined,attributes=(inbox?` from="${inbox.address}"`:'')+(senderMode?` from-mode="${senderMode}"`:'');
+  const body=wrapped?`<cross-session-message${attributes}>\n${text}${inbox?'\n\nReply using SendMessage to the from address above.':''}\n</cross-session-message>`:text;
+  const payload=JSON.stringify({type:'user',session_id:id,uuid:msgId,msg_id:msgId,...wrapped&&{msgV:1},from:inbox?.address||'external-agent',message:{role:'user',content:body}})+'\n';
   if(payload.length>1000000)fail('message_too_large','Serialized message exceeds 1,000,000 characters');
   let deadline;
   await new Promise((resolve,reject)=>{
@@ -295,12 +297,13 @@ async function send() {
   }
 }
 async function main() {
-  if(args.help||!command)return {usage:'bun scripts/sessions.mjs list | read --id UUID [--tail N --max-chars N --before UUID --after UUID --events] | send --id UUID --pid PID --text TEXT [--wait SECONDS --reply-ttl SECONDS] | wait --request PATH [--timeout SECONDS] | close --request PATH',configDir:root};
+  if(args.help||!command)return {usage:'bun scripts/sessions.mjs list | read --id UUID [--tail N --max-chars N --before UUID --after UUID --events] | send --id UUID --pid PID --text TEXT [--sender-mode bypass|prompting --wait SECONDS --reply-ttl SECONDS] | wait --request PATH [--timeout SECONDS] | close --request PATH',configDir:root};
   if(positionals.length!==1)fail('invalid_argument','Unexpected positional arguments; pass message text with --text');
   if(!['darwin','linux'].includes(process.platform))fail('unsupported_platform','Only macOS and Linux Unix sockets are supported');
   if(args.wait!==undefined&&command!=='send')fail('invalid_argument','--wait is only supported by send');
   if(args['reply-ttl']!==undefined&&(command!=='send'||args.wait===undefined))fail('invalid_argument','--reply-ttl requires send --wait');
   if(args.timeout!==undefined&&command!=='wait')fail('invalid_argument','--timeout is only supported by wait');
+  if(args['sender-mode']!==undefined&&command!=='send')fail('invalid_argument','--sender-mode is only supported by send');
   if(command==='_receive'){await receiveReply(args.request,validateTarget);return {status:'closed'}}
   if(command==='close')return closeReply(args.request);
   if(command==='wait'){
