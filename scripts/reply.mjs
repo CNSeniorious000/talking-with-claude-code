@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { createServer } from 'node:net';
 
-export async function replyInbox(socketPath, messageId, validateTarget, {signals=true,onReceipt=()=>{}}={}) {
+export async function replyInbox(socketPath, messageId, validateTarget, {signals=true,onReceipt=()=>{},persistent=false,onReply=()=>{}}={}) {
   // Bun on macOS cannot realpath a socket itself; resolve only its directory.
   const canonical=path=>`uds:${join(realpathSync(dirname(path)),basename(path))}`,expected=canonical(socketPath);
   const directory=mkdtempSync(join(tmpdir(),'ccs-reply-')),path=join(directory,'inbox.sock'),peers=new Set();
@@ -34,8 +34,9 @@ export async function replyInbox(socketPath, messageId, validateTarget, {signals
         }
         if(frame.type!=='user'||frame.message?.role!=='user'||typeof frame.message.content!=='string'||!frame.message.content.trim())continue;
         try{validateTarget()}catch{finish({status:'target_changed'});return}
-        finish({status:'received',from:frame.from,messageId:frame.msg_id||null,text:frame.message.content,receivedAt:new Date().toISOString()});
-        return;
+        const result={status:'received',from:frame.from,messageId:frame.msg_id||null,text:frame.message.content,receivedAt:new Date().toISOString()};
+        if(!persistent){finish(result);return}
+        try{const terminal=onReply(result);if(terminal){finish(terminal);return}}catch(e){finish({status:'inbox_error',message:e.message});return}
       }
     });
   });

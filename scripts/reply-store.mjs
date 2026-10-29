@@ -35,10 +35,10 @@ function observe(directory,read,seconds){
     }catch(e){done(undefined,e)}
   });
 }
-export async function startReply(entrypoint,row,socket,messageId,ttl){
+export async function startReply(entrypoint,row,socket,messageId,ttl,channel){
   const directory=realpathSync(mkdtempSync(join(tmpdir(),'ccs-request-')));chmodSync(directory,0o700);
   const request=join(directory,'request.json'),expiresAt=new Date(Date.now()+ttl*1000).toISOString();
-  publish(directory,'request.json',{kind:'claude-code-reply',version:1,directory,expiresAt,row,socket,messageId});
+  publish(directory,'request.json',{kind:'claude-code-reply',version:1,directory,expiresAt,row,socket,messageId,...channel&&{channel}});
   const child=spawn(process.execPath,[entrypoint,'_receive','--request',request],{detached:true,stdio:'ignore'});let startupError;
   child.on('error',e=>startupError=e);
   try{
@@ -52,14 +52,21 @@ export async function startReply(entrypoint,row,socket,messageId,ttl){
   }catch(e){if(child.exitCode===null)child.kill('SIGTERM');throw Object.assign(e,{request,expiresAt})}
 }
 export async function receiveReply(request,validateTarget){
-  const {directory,data}=load(request);let inbox,watcher,result;
+  const {directory,data}=load(request);let inbox,watcher,result,bytes=0;const messages=[],seen=new Set();
   const cancel=()=>inbox?.cancel();
   try{
     validateTarget(data.row,data.socket);
-    inbox=await replyInbox(data.socket.path,data.messageId,()=>validateTarget(data.row,data.socket),{signals:false,onReceipt:receipt=>publish(directory,'receipt.json',receipt)});
+    inbox=await replyInbox(data.socket.path,data.messageId,()=>validateTarget(data.row,data.socket),{signals:false,persistent:!!data.channel,onReceipt:receipt=>publish(directory,'receipt.json',receipt),onReply:reply=>{
+      if(reply.messageId&&seen.has(reply.messageId))return;
+      const size=Buffer.byteLength(JSON.stringify(reply));
+      // Bound retained state without silently evicting unread messages. The terminal status is observable after draining the queue.
+      if(messages.length>=256||bytes+size>16*1024*1024)return {status:'queue_full'};
+      messages.push({...reply,seq:messages.length+1});publish(directory,'messages.json',messages);bytes+=size;if(reply.messageId)seen.add(reply.messageId);
+    }});
     const check=()=>{if(existsSync(join(directory,'cancel')))cancel()};
     watcher=watch(directory,check);watcher.on('error',cancel);process.on('SIGINT',cancel);process.on('SIGTERM',cancel);
-    publish(directory,'ready.json',{address:inbox.address,pid:process.pid});check();
+    const ownSocket=lstatSync(inbox.address.slice(4));
+    publish(directory,'ready.json',{address:inbox.address,pid:process.pid,ino:ownSocket.ino,dev:ownSocket.dev});check();
     result=await inbox.wait(Math.max(0,(Date.parse(data.expiresAt)-Date.now())/1000));
     if(result.status==='timeout')result.status='expired';
   }catch(e){result={status:'inbox_error',message:e.message}}
@@ -71,10 +78,39 @@ export async function receiveReply(request,validateTarget){
 }
 export async function waitReply(request,seconds){
   const {directory,data}=load(request);
+  if(data.channel)throw failure('invalid_argument','Use wait --channel for a persistent channel');
   const read=()=>!existsSync(join(directory,'request.json'))?{status:'closed'}:existsSync(join(directory,'reply.json'))?privateFile(join(directory,'reply.json')):Date.now()>=Date.parse(data.expiresAt)?{status:'expired'}:undefined;
   const result=seconds?await observe(directory,read,Math.min(seconds,Math.max(0,(Date.parse(data.expiresAt)-Date.now())/1000))):read();
   const receipt=existsSync(join(directory,'receipt.json'))?privateFile(join(directory,'receipt.json')):null;
   return {request:join(directory,'request.json'),expiresAt:data.expiresAt,sessionId:data.row.sessionId,messageId:data.messageId,reply:result||{status:seconds?'timeout':'pending',...receipt&&{receipt}}};
+}
+export function loadChannel(channel,{active=false}={}){
+  const state=load(channel),{directory,data}=state;
+  if(!data.channel)throw failure('invalid_channel','--channel requires a handle returned by open');
+  const ready=privateFile(join(directory,'ready.json'));
+  if(active){
+    if(existsSync(join(directory,'done.json'))||Date.now()>=Date.parse(data.expiresAt))throw failure('channel_closed','Channel is closed or expired; cached messages can still be read');
+    try{process.kill(ready.pid,0);const socket=lstatSync(ready.address.slice(4));if(!socket.isSocket()||socket.uid!==process.getuid()||socket.ino!==ready.ino||socket.dev!==ready.dev)throw Error('Socket identity changed')}
+    catch(e){throw failure('channel_unavailable',`Channel receiver unavailable: ${e.message}`)}
+  }
+  return {...state,ready};
+}
+export async function waitChannel(channel,after,seconds,validateTarget){
+  const {directory,data,ready}=loadChannel(channel);
+  const terminal=()=>!existsSync(join(directory,'request.json'))?{status:'closed'}:existsSync(join(directory,'reply.json'))?privateFile(join(directory,'reply.json')):Date.now()>=Date.parse(data.expiresAt)?{status:'expired'}:existsSync(join(directory,'cancel'))?{status:'cancelled'}:undefined;
+  const read=()=>{
+    try{
+    if(!existsSync(join(directory,'request.json')))return {status:'closed'};
+    const messages=existsSync(join(directory,'messages.json'))?privateFile(join(directory,'messages.json')):[];
+    const next=messages.find(message=>message.seq>after);if(next)return next;
+    const ended=terminal();if(ended)return ended;
+    try{validateTarget(data.row,data.socket)}catch{return {status:'target_changed'}}
+    // Shutdown can occur between the queue snapshot and liveness check. Prefer its recorded terminal reason.
+    try{loadChannel(channel,{active:true})}catch(e){return terminal()||{status:e.code||'channel_unavailable'}}
+    }catch(e){if(e.code==='ENOENT'&&!existsSync(join(directory,'request.json')))return {status:'closed'};throw e}
+  };
+  const reply=await observe(directory,read,Math.min(seconds,Math.max(0,(Date.parse(data.expiresAt)-Date.now())/1000)));
+  return {channel,address:ready.address,name:data.channel.name,sessionId:data.row.sessionId,expiresAt:data.expiresAt,reply:reply||{status:'timeout'}};
 }
 export async function closeReply(request){
   const {directory}=load(request);
@@ -84,7 +120,7 @@ export async function closeReply(request){
     if(!done)throw failure('reply_close_timeout','Receiver has not confirmed shutdown; request state was retained');
   }
   // Delete only our known files; never recursively remove a caller-provided directory.
-  for(const name of ['request.json','ready.json','reply.json','receipt.json','done.json','cancel']){
+  for(const name of ['request.json','ready.json','reply.json','receipt.json','messages.json','done.json','cancel']){
     for(const suffix of ['', '.tmp']){
       const file=join(directory,name+suffix);if(!existsSync(file))continue;
       const stat=lstatSync(file);if(!stat.isFile()||stat.isSymbolicLink()||stat.uid!==process.getuid())throw failure('unsafe_request','Unexpected file in reply state');

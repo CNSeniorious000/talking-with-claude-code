@@ -33,7 +33,7 @@ async function fixture(check, { onData, onMessage } = {}) {
     try {
       child.stdin.write(input); child.stdin.end();
       const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-      const data=JSON.parse(stdout||stderr);if(data.request&&argv[0]!=='close')requests.add(data.request);
+      const data=JSON.parse(stdout||stderr);if((data.request||data.channel)&&argv[0]!=='close')requests.add(data.request||data.channel);
       return {code,data};
     } finally { clearTimeout(timeout); if (child.exitCode === null) child.kill(); await child.exited; }
   };
@@ -511,4 +511,96 @@ test('waiting does not implicitly attest a permission mode',()=>fixture(async f=
 test('invalid sender mode is refused before any socket connection',()=>fixture(async f=>{
   expect((await f.send('hello','--sender-mode','auto')).data.error).toBe('invalid_argument');
   expect((await f.run(['list','--sender-mode','bypass'])).data.error).toBe('invalid_argument');expect(f.connections()).toBe(0);
+}));
+
+const openTestChannel=(f,...args)=>f.run(['open','--id',f.id,'--pid',String(process.pid),'--name','Codex · 主任务',...args]);
+const channelFrame=(f,text,id=randomUUID())=>({type:'user',from:'uds:'+f.socketPath,msg_id:id,message:{role:'user',content:text}});
+
+test('a named channel supports multiple sends and replies at one address without resending',()=>fixture(async f=>{
+  const opened=await openTestChannel(f,'--sender-mode','bypass'),{channel,address}=opened.data;
+  expect(opened.code).toBe(0);expect(f.connections()).toBe(0);
+  for(const text of ['FIRST','SECOND']){
+    expect((await f.run(['send','--channel',channel,'--text',text])).data.address).toBe(address);
+  }
+  expect(f.received.map(s=>JSON.parse(s).from)).toEqual([address,address]);
+  expect(JSON.parse(f.received[0]).message.content).toContain('from-name="Codex · 主任务" from-mode="bypass"');
+  expect(JSON.parse(f.received[0]).message.content).toContain('Never substitute another session');
+  const duplicate=channelFrame(f,'first');
+  postReply(address,[duplicate,duplicate,channelFrame(f,'second')]);
+  const first=await f.run(['wait','--channel',channel,'--after','0','--timeout','1']);
+  expect(first.data.reply).toMatchObject({seq:1,text:'first'});
+  expect(existsSync(address.slice(4))).toBe(true);
+  expect((await f.run(['wait','--channel',channel,'--after','1','--timeout','1'])).data.reply).toMatchObject({seq:2,text:'second'});
+  expect((await f.run(['wait','--channel',channel,'--after','1','--timeout','1'])).data.reply.seq).toBe(2);
+  expect((await f.run(['wait','--channel',channel,'--after','2','--timeout','1'])).data.reply.status).toBe('timeout');
+  postReply(address,[channelFrame(f,'third')]);
+  expect((await f.run(['wait','--channel',channel,'--after','2','--timeout','1'])).data.reply).toMatchObject({seq:3,text:'third'});
+  expect(f.connections()).toBe(2);
+}));
+
+test('channel identity cannot be overridden and invalid display names fail before opening',()=>fixture(async f=>{
+  for(const name of ['', ' quote"', '<tag>', 'line\nbreak', 'x'.repeat(65)]){
+    expect((await f.run(['open','--id',f.id,'--pid',String(process.pid),'--name',name])).data.error).toBe('invalid_argument');
+  }
+  const {channel}= (await openTestChannel(f)).data;
+  for(const args of [['--id',randomUUID()],['--pid','1'],['--sender-mode','bypass'],['--wait','1']]){
+    expect((await f.run(['send','--channel',channel,'--text','hello',...args])).data.error).toBe('invalid_argument');
+  }
+  expect((await f.run(['wait','--channel',channel,'--after=-1'])).data.error).toBe('invalid_argument');
+  expect((await f.run(['wait','--request',channel])).data.error).toBe('invalid_argument');
+  expect(f.connections()).toBe(0);
+}));
+
+test('channel rejects foreign replies and a replacement target, retaining previously accepted messages',()=>fixture(async f=>{
+  const {channel,address}=(await openTestChannel(f)).data;
+  postReply(address,[{...channelFrame(f,'foreign'),from:address},channelFrame(f,'accepted')]);
+  expect((await f.run(['wait','--channel',channel,'--timeout','1'])).data.reply.text).toBe('accepted');
+  f.registration({sessionId:randomUUID()});
+  expect((await f.run(['send','--channel',channel,'--text','must not send'])).data.error).toBe('target_changed');
+  expect((await f.run(['wait','--channel',channel,'--after','1','--timeout','1'])).data.reply.status).toBe('target_changed');
+  expect((await f.run(['wait','--channel',channel,'--after','0','--timeout','1'])).data.reply.text).toBe('accepted');
+  expect(f.connections()).toBe(0);
+}));
+
+test('channel expiry preserves cached replies and blocks new sends',()=>fixture(async f=>{
+  const {channel,address}=(await openTestChannel(f,'--ttl','1')).data;
+  postReply(address,[channelFrame(f,'before expiry')]);
+  expect((await f.run(['wait','--channel',channel,'--timeout','1'])).data.reply.seq).toBe(1);
+  expect((await f.run(['wait','--channel',channel,'--after','1','--timeout','2'])).data.reply.status).toBe('expired');
+  expect((await f.run(['send','--channel',channel,'--text','too late'])).data.error).toBe('channel_closed');
+  expect((await f.run(['wait','--channel',channel,'--timeout','1'])).data.reply.text).toBe('before expiry');
+}));
+
+test('channel close wakes waiters and removes the persistent socket',()=>fixture(async f=>{
+  const {channel,address}=(await openTestChannel(f)).data;
+  const pending=f.run(['wait','--channel',channel,'--timeout','3']);
+  // Wait until the observer exists; the close operation must wake it, not wait for its timeout.
+  await Bun.sleep(100);
+  expect((await f.run(['close','--channel',channel])).data.status).toBe('closed');
+  expect(['closed','cancelled']).toContain((await pending).data.reply.status);
+  expect(existsSync(address.slice(4))).toBe(false);expect(existsSync(channel)).toBe(false);
+}));
+
+test('follow streams NDJSON and stopping it leaves the channel available',()=>fixture(async f=>{
+  const {channel,address}=(await openTestChannel(f)).data;
+  const child=Bun.spawn([process.execPath,cli,'follow','--channel',channel,'--after','0'],{stdout:'pipe',stderr:'pipe'});
+  const reader=child.stdout.getReader();let output='';
+  const guard=setTimeout(()=>child.kill(),3000);
+  try{
+    postReply(address,[channelFrame(f,'one'),channelFrame(f,'two')]);
+    while(output.trim().split('\n').length<2){const {value,done}=await reader.read();if(done)throw Error('follow exited early');output+=new TextDecoder().decode(value)}
+    expect(output.trim().split('\n').map(s=>JSON.parse(s).reply.seq)).toEqual([1,2]);
+    child.kill('SIGTERM');await child.exited;
+    expect(existsSync(address.slice(4))).toBe(true);
+    postReply(address,[channelFrame(f,'three')]);
+    expect((await f.run(['wait','--channel',channel,'--after','2','--timeout','1'])).data.reply.seq).toBe(3);
+  }finally{clearTimeout(guard);reader.releaseLock();if(child.exitCode===null)child.kill();await child.exited}
+}));
+
+test('a full channel queue retains its accepted messages and reports overflow',()=>fixture(async f=>{
+  const {channel,address}=(await openTestChannel(f)).data;
+  postReply(address,Array.from({length:257},(_,i)=>channelFrame(f,String(i+1))));
+  expect((await f.run(['wait','--channel',channel,'--after','255','--timeout','2'])).data.reply).toMatchObject({seq:256,text:'256'});
+  expect((await f.run(['wait','--channel',channel,'--after','256','--timeout','2'])).data.reply.status).toBe('queue_full');
+  expect((await f.run(['wait','--channel',channel,'--after','0','--timeout','1'])).data.reply.text).toBe('1');
 }));
