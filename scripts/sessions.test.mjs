@@ -62,6 +62,49 @@ test('list and read inspect the owned live PID without connecting to its inbox',
   expect(f.connections()).toBe(0);
 }));
 
+test('list --no-preview never opens transcripts and rejects use on other commands', () => fixture(async f => {
+  rmSync(f.transcript);symlinkSync('/nonexistent-transcript',f.transcript);
+  const result=await f.run(['list','--no-preview']);
+  expect(result.code).toBe(0);expect(result.data.sessions[0].processIdentity).toBe('verified');
+  expect(result.data.sessions[0]).not.toHaveProperty('transcriptError');expect(result.data.sessions[0]).not.toHaveProperty('lastMessage');
+  expect((await f.run(['read','--id',f.id,'--no-preview'])).data.error).toBe('invalid_argument');expect(f.connections()).toBe(0);
+}));
+
+test('unrecognized transcript types warn once without losing known messages', () => fixture(async f => {
+  f.conversation([turn('user','visible'),{type:'future-metadata'},{type:'future-metadata'},null]);
+  const result=await f.read();
+  expect(result.code).toBe(0);expect(result.data.messages.map(message=>message.text)).toEqual(['visible']);
+  expect(result.data.warnings.filter(warning=>warning.includes('future-metadata'))).toHaveLength(1);
+  expect(result.data.warnings.some(warning=>warning.includes('Invalid transcript record'))).toBe(true);
+}));
+
+test('channels inventories retained handles without sending and refuses symlinked state', () => fixture(async f => {
+  const opened=await f.run(['open','--id',f.id,'--pid',String(process.pid),'--name','inventory']);
+  expect(opened.code).toBe(0);
+  const listed=await f.run(['channels']);expect(listed.data.channels).toHaveLength(1);
+  expect(listed.data.channels[0]).toMatchObject({channel:opened.data.channel,name:'inventory',sessionId:f.id,pid:process.pid,status:'open',cursor:opened.data.cursor});
+  const alias=join(f.root,'ccs-request-alias');symlinkSync(opened.data.channel.replace('/request.json',''),alias);
+  const guarded=await f.run(['channels']);expect(guarded.data.channels).toHaveLength(1);
+  expect(guarded.data.warnings.some(warning=>warning.error==='unsafe_request')).toBe(true);
+  rmSync(alias);expect(f.connections()).toBe(0);
+}));
+
+test('message status distinguishes unknown messages from closed channels and rejects path IDs', () => fixture(async f => {
+  const opened=await f.run(['open','--id',f.id,'--pid',String(process.pid),'--name','status']),channel=opened.data.channel;
+  const messageId=randomUUID();
+  expect((await f.run(['status','--channel',channel,'--message-id',messageId])).data.error).toBe('message_unknown');
+  for(const command of ['status','send']){
+    const args=[command,'--channel',channel,'--message-id','../../escape'];if(command==='send')args.push('--text','reject');
+    expect((await f.run(args)).data.error).toBe('invalid_argument');
+  }
+  const {sendChannel,outgoingStatus}=await import('./reply-store.mjs');
+  expect(()=>outgoingStatus(channel,'../../escape')).toThrow('lowercase UUID');
+  await expect(sendChannel(channel,'reject','../../escape')).rejects.toThrow('lowercase UUID');
+  expect((await f.run(['close','--channel',channel])).code).toBe(0);
+  expect((await f.run(['status','--channel',channel,'--message-id',messageId])).data.error).toBe('channel_closed');
+  expect(f.connections()).toBe(0);
+}));
+
 test('a stale process start identity blocks sending before connection', () => fixture(async f => {
   f.registration({ procStart: 'stale' });
   const result = await f.send();

@@ -8,7 +8,7 @@ import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { startReply, receiveReply, waitReply, closeReply, loadChannel, waitChannel, sendChannel, outgoingStatus } from './reply-store.mjs';
+import { startReply, receiveReply, waitReply, closeReply, loadChannel, waitChannel, sendChannel, outgoingStatus, listChannels } from './reply-store.mjs';
 import { writeFrame } from './transport.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -16,7 +16,7 @@ class Failure extends Error { constructor(code, message) { super(message); this.
 const fail = (code, message) => { throw new Failure(code, message); };
 const missing = e => e.code === 'ENOENT' || e.code === 'ESRCH';
 const normalize = s => String(s).trim().replace(/\s+/g, ' ');
-const options = {id:{type:'string'},pid:{type:'string'},text:{type:'string'},wait:{type:'string'},request:{type:'string'},channel:{type:'string'},name:{type:'string'},ttl:{type:'string'},timeout:{type:'string'},'message-id':{type:'string'},'reply-ttl':{type:'string'},'sender-mode':{type:'string'},tail:{type:'string'},'max-chars':{type:'string'},before:{type:'string'},after:{type:'string'},events:{type:'boolean'},'config-dir':{type:'string'},help:{type:'boolean'}};
+const options = {id:{type:'string'},pid:{type:'string'},text:{type:'string'},wait:{type:'string'},request:{type:'string'},channel:{type:'string'},name:{type:'string'},ttl:{type:'string'},timeout:{type:'string'},'message-id':{type:'string'},'reply-ttl':{type:'string'},'sender-mode':{type:'string'},tail:{type:'string'},'max-chars':{type:'string'},before:{type:'string'},after:{type:'string'},events:{type:'boolean'},'no-preview':{type:'boolean'},'config-dir':{type:'string'},help:{type:'boolean'}};
 let args,positionals,command,root;
 const number = (name, fallback, max) => { const value=args[name]===undefined?fallback:Number(args[name]); if(!Number.isSafeInteger(value)||value<0||value>max)fail('invalid_argument',`--${name} must be an integer between 0 and ${max}`); return value; };
 function sessionId() { if(!UUID.test(args.id||''))fail('invalid_argument','--id requires a full session UUID'); return args.id; }
@@ -202,11 +202,17 @@ function recoverBatches(nodes,branch,warnings) {
 }
 async function conversation(id,events=false) {
   const file=await transcriptPath(id),records=[],warnings=[];
+  const knownTypes=new Set(['user','assistant','system','attachment','last-prompt','mode','permission-mode','atis-latch','file-history-snapshot','file-history-delta','api-request-shape','api-request-blob','api-request','queue-operation','tools-used','ai-title','summary','progress','custom-title','tag','agent-name','agent-color']),unknownTypes=new Set();
   let line=0;
   for await(const text of createInterface({input:createReadStream(file),crlfDelay:Infinity})) {
     line++;if(!text.trim())continue;
-    try { records.push(JSON.parse(text)); } catch { warnings.push(`Unparsed transcript line ${line}; it may be an incomplete write`); }
+    try {
+      const record=JSON.parse(text);
+      if(!record||typeof record!=='object'||Array.isArray(record)){warnings.push(`Invalid transcript record at line ${line}`);continue}
+      if(!knownTypes.has(record.type))unknownTypes.add(String(record.type));records.push(record);
+    } catch { warnings.push(`Unparsed transcript line ${line}; it may be an incomplete write`); }
   }
+  for(const type of unknownTypes)warnings.push(`Unrecognized transcript record type: ${type}; context may be incomplete`);
   const nodes=new Map(records.filter(r=>r.uuid).map(r=>[r.uuid,r]));
   const compact=relinkCompaction(nodes,warnings);let ancestryIncomplete=!!compact.incomplete;
   const last=currentLeaf(records,nodes,compact);
@@ -304,7 +310,8 @@ async function send() {
 }
 async function main() {
   if(args.help||!command)return {usage:[
-    'bun scripts/sessions.mjs list',
+    'bun scripts/sessions.mjs list [--no-preview]',
+    'channels',
     'read --id UUID [--tail N --max-chars N --before UUID --after UUID --events]',
     'open --id UUID --pid PID --name NAME [--sender-mode bypass|prompting --ttl SECONDS]',
     'send --id UUID --pid PID --text TEXT [--sender-mode bypass|prompting --wait SECONDS --reply-ttl SECONDS]',
@@ -316,6 +323,7 @@ async function main() {
     'close (--channel PATH | --request PATH)'
   ],configDir:root};
   if(positionals.length!==1)fail('invalid_argument','Unexpected positional arguments; pass message text with --text');
+  if(args['no-preview']!==undefined&&command!=='list')fail('invalid_argument','--no-preview is only supported by list');
   if(!['darwin','linux'].includes(process.platform))fail('unsupported_platform','Only macOS and Linux Unix sockets are supported');
   if(args.wait!==undefined&&command!=='send')fail('invalid_argument','--wait is only supported by send');
   if(args['reply-ttl']!==undefined&&(command!=='send'||args.wait===undefined))fail('invalid_argument','--reply-ttl requires send --wait');
@@ -353,11 +361,12 @@ async function main() {
     const result=await waitReply(args.request,timeout);if(result.reply.status!=='received')process.exitCode=2;return result;
   }
   if(command==='read')return {sessionId:sessionId(),...page(await conversation(args.id,args.events))};
+  if(command==='channels')return listChannels(root,validateTarget);
   if(command==='send')return send();
   if(command!=='list')fail('invalid_argument',`Unknown command: ${command}`);
   const {rows,warnings}=registrations(),sessions=[];
   for(const row of rows) {
-    let context={};try{const c=await conversation(row.sessionId),last=c.messages.at(-1);context={source:c.source,lastMessage:last?{...last,text:last.text.slice(0,500),truncated:last.text.length>500}:null,latestUser:c.messages.findLast(m=>m.role==='user')?.text.slice(0,300),ancestryIncomplete:c.ancestryIncomplete,transcriptWarnings:c.warnings};}catch(e){context={transcriptError:e.code||e.message}}
+    let context={};if(!args['no-preview'])try{const c=await conversation(row.sessionId),last=c.messages.at(-1);context={source:c.source,lastMessage:last?{...last,text:last.text.slice(0,500),truncated:last.text.length>500}:null,latestUser:c.messages.findLast(m=>m.role==='user')?.text.slice(0,300),ancestryIncomplete:c.ancestryIncomplete,transcriptWarnings:c.warnings};}catch(e){context={transcriptError:e.code||e.message}}
     sessions.push({id:row.sessionId,pid:row.pid,name:row.name||null,cwd:row.cwd,status:row.status||'unknown',statusUpdatedAt:row.statusUpdatedAt||null,waitingFor:row.waitingFor||null,version:row.version,processIdentity:row.processIdentity,socket:row.messagingSocketPath||null,...context});
   }
   const verified=sessions.filter(s=>s.processIdentity==='verified').length;

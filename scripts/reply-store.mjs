@@ -8,6 +8,7 @@ import { writeFrame } from './transport.mjs';
 import { eventWriter, channelEvents, channelCursor, cursorFor } from './channel-events.mjs';
 
 const failure=(code,message)=>Object.assign(new Error(message),{code});
+const validMessageId=id=>{if(typeof id!=='string'||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id))throw failure('invalid_argument','Message ID must be a lowercase UUID')};
 const json=file=>JSON.parse(readFileSync(file,'utf8'));
 function privateFile(file){
   const stat=lstatSync(file);
@@ -138,6 +139,7 @@ export function loadChannel(channel,{active=false}={}){
   return {...state,ready};
 }
 export async function sendChannel(channel,payload,messageId){
+  validMessageId(messageId);
   const {directory}=loadChannel(channel,{active:true}),outgoing=join(directory,'outgoing'),file=join(outgoing,messageId+'.json');
   const hash=createHash('sha256').update(payload).digest('hex');
   if(!existsSync(file)){
@@ -157,8 +159,27 @@ export async function sendChannel(channel,payload,messageId){
   return {...result||{status:'queued'},queuedAt:job.queuedAt};
 }
 export function outgoingStatus(channel,messageId){
-  const {directory}=loadChannel(channel),job=privateFile(join(directory,'outgoing',messageId+'.json'));
-  return {channel,messageId,queuedAt:job.queuedAt,...job.result||{status:'queued'}};
+  validMessageId(messageId);
+  try{
+    const {directory}=loadChannel(channel),file=join(directory,'outgoing',messageId+'.json');
+    if(!existsSync(file))throw failure('message_unknown','No outgoing message with this ID is recorded in this channel');
+    const job=privateFile(file);return {channel,messageId,queuedAt:job.queuedAt,...job.result||{status:'queued'}};
+  }catch(e){if(e.code==='ENOENT')throw failure('channel_closed','Channel state is no longer available');throw e}
+}
+export function listChannels(configDir,validateTarget){
+  const channels=[],warnings=[];
+  for(const entry of readdirSync(tmpdir(),{withFileTypes:true}).filter(entry=>entry.name.startsWith('ccs-request-'))){
+    const channel=join(tmpdir(),entry.name,'request.json');
+    try{
+      const {directory,data}=load(channel);if(!data.channel||resolve(dirname(dirname(data.row.registryFile)))!==resolve(configDir))continue;
+      const {ready}=loadChannel(channel);let status='open';
+      if(existsSync(join(directory,'reply.json')))status=privateFile(join(directory,'reply.json')).status;
+      else if(Date.now()>=Date.parse(data.expiresAt))status='expired';
+      else try{loadChannel(channel,{active:true});validateTarget(data.row,data.socket)}catch(e){status=e.code||'channel_unavailable'}
+      channels.push({channel:join(data.directory,'request.json'),name:data.channel.name,sessionId:data.row.sessionId,pid:data.row.pid,address:ready.address,expiresAt:data.expiresAt,status,cursor:cursorFor(data,0)});
+    }catch(e){if(e.code!=='ENOENT')warnings.push({channel,error:e.code||'invalid_request',message:e.message})}
+  }
+  return {capturedAt:new Date().toISOString(),channels,warnings};
 }
 export async function waitChannel(channel,after,seconds,validateTarget){
   const {directory,data,ready}=loadChannel(channel);
