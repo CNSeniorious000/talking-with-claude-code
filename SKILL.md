@@ -1,6 +1,6 @@
 ---
 name: claude-code-sessions
-description: Read or message local Claude Code sessions from any agent via shell and a bundled Bun CLI. Use for Claude session activity, context, questions or handoffs; not for Codex or web chat history.
+description: Read or message local Claude Code sessions from any agent via shell and a bundled Bun CLI. Use for Claude session activity, context, questions or handoffs.
 license: MIT
 compatibility: Bun, macOS or Linux, and local Claude Code session files. Sending requires Claude Code's native inbox socket.
 metadata:
