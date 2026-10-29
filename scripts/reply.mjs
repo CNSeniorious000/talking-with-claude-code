@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { createServer } from 'node:net';
 
-export async function replyInbox(socketPath, messageId, validateTarget) {
+export async function replyInbox(socketPath, messageId, validateTarget, {signals=true,onReceipt=()=>{}}={}) {
   // Bun on macOS cannot realpath a socket itself; resolve only its directory.
   const canonical=path=>`uds:${join(realpathSync(dirname(path)),basename(path))}`,expected=canonical(socketPath);
   const directory=mkdtempSync(join(tmpdir(),'ccs-reply-')),path=join(directory,'inbox.sock'),peers=new Set();
@@ -28,6 +28,7 @@ export async function replyInbox(socketPath, messageId, validateTarget) {
           try{validateTarget()}catch{finish({status:'target_changed'});return}
           const status=frame.status==='expired'&&frame.status_detail==='refused'?'refused':frame.status;
           receipt={status,reason:frame.reason};
+          onReceipt(receipt);
           if(!['held','delivered'].includes(status)){finish({status,receipt});return}
           continue;
         }
@@ -49,8 +50,8 @@ export async function replyInbox(socketPath, messageId, validateTarget) {
     chmodSync(directory,0o700);
     if(Buffer.byteLength(path)>100)throw error('reply_path_too_long','TMPDIR is too long for a Unix reply socket; use a shorter private temporary directory');
     await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(path,resolve)});
-    chmodSync(path,0o600);process.on('SIGINT',interrupt);process.on('SIGTERM',terminate);
-    return {address:`uds:${path}`,close,wait:async seconds=>{
+    chmodSync(path,0o600);if(signals){process.on('SIGINT',interrupt);process.on('SIGTERM',terminate)}
+    return {address:`uds:${path}`,close,cancel:()=>finish({status:'cancelled'}),wait:async seconds=>{
       timer=setTimeout(()=>finish({status:'timeout',...receipt&&{receipt}}),seconds*1000);
       return response;
     }};

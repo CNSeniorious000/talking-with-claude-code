@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, watch, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createConnection, createServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
@@ -13,7 +13,7 @@ const boundary = (compactMetadata = {}) => ({ type: 'system', subtype: 'compact_
 
 async function fixture(check, { onData, onMessage } = {}) {
   // A short path avoids macOS's Unix socket path limit; never inspect ~/.claude.
-  const root = mkdtempSync('/tmp/ccs-test-'), id = randomUUID(), peers = new Set(), received = [];
+  const root = mkdtempSync('/tmp/ccs-test-'), id = randomUUID(), peers = new Set(), received = [], requests = new Set();
   chmodSync(root, 0o700);
   mkdirSync(join(root, 'sessions')); mkdirSync(join(root, 'projects')); mkdirSync(join(root, 'projects', 'fixture'));
   const socketPath = join(root, 'inbox.sock'), registry = join(root, 'sessions', `${process.pid}.json`), transcript = join(root, 'projects', 'fixture', `${id}.jsonl`);
@@ -28,12 +28,13 @@ async function fixture(check, { onData, onMessage } = {}) {
   const conversation = (rows, suffix = '') => writeFileSync(transcript, rows.map(row => JSON.stringify(row)).join('\n') + '\n' + suffix);
   const run = async (argv, input = '') => {
     // A synchronous child would starve this process's mock socket server.
-    const child = Bun.spawn([process.execPath, cli, '--config-dir', root, ...argv], { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe', env: { ...process.env, CLAUDE_CONFIG_DIR: root } });
+    const child = Bun.spawn([process.execPath, cli, '--config-dir', root, ...argv], { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe', env: { ...process.env, CLAUDE_CONFIG_DIR: root, TMPDIR:root } });
     const timeout = setTimeout(() => child.kill(), 7000);
     try {
       child.stdin.write(input); child.stdin.end();
       const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-      return { code, data: JSON.parse(stdout || stderr) };
+      const data=JSON.parse(stdout||stderr);if(data.request&&argv[0]!=='close')requests.add(data.request);
+      return {code,data};
     } finally { clearTimeout(timeout); if (child.exitCode === null) child.kill(); await child.exited; }
   };
   const read = (...args) => run(['read', '--id', id, ...args]);
@@ -43,6 +44,7 @@ async function fixture(check, { onData, onMessage } = {}) {
     registration(); conversation([]);
     await check({ root, id, registry, transcript, socketPath, registration, conversation, run, read, send, received, connections: () => connections });
   } finally {
+    for(const request of requests){const closed=await run(['close','--request',request]);if(closed.code!==0&&closed.data.error!=='ENOENT')throw Error(JSON.stringify(closed.data))}
     for (const peer of peers) peer.destroy();
     if (server.listening) await new Promise(resolve => server.close(resolve));
     rmSync(root, { recursive: true, force: true });
@@ -337,7 +339,7 @@ test('send --wait receives the first native reply and removes its request-specif
 test('delivery receipts and foreign senders do not satisfy --wait', () => fixture(async f=>{
   const result=await f.send('Wait for an answer','--wait','1'),sent=JSON.parse(f.received[0]);
   expect(result.code).toBe(2);expect(result.data.status).toBe('submitted');expect(result.data.reply.status).toBe('timeout');
-  expect(result.data.reply.receipt.status).toBe('delivered');expect(existsSync(sent.from.slice(4))).toBe(false);expect(f.connections()).toBe(1);
+  expect(result.data.reply.receipt.status).toBe('delivered');expect(existsSync(sent.from.slice(4))).toBe(true);expect(f.connections()).toBe(1);
 },{onMessage:(text,path)=>{
   const sent=JSON.parse(text);
   postReply(sent.from,[
@@ -365,7 +367,7 @@ test('concurrent requests have distinct reply inboxes', () => fixture(async f=>{
 }}));
 
 test('invalid wait arguments cannot send a message', () => fixture(async f=>{
-  for(const wait of ['0','-1','1.5','3601'])expect((await f.send('hello',`--wait=${wait}`)).data.error).toBe('invalid_argument');
+  for(const wait of ['-1','1.5','3601'])expect((await f.send('hello',`--wait=${wait}`)).data.error).toBe('invalid_argument');
   expect((await f.run(['list','--wait','1'])).data.error).toBe('invalid_argument');expect(f.connections()).toBe(0);
 }));
 
@@ -387,14 +389,16 @@ test('held receipts remain distinct from answers and do not trigger retries', ()
   const sent=JSON.parse(text);postReply(sent.from,[{type:'control',from:'uds:'+path,action:'peer_message_status',status:'held',orig_msg_id:sent.msg_id}]);
 }}));
 
-test('interrupting --wait removes its socket and temporary directory', () => fixture(async f=>{
-  const child=Bun.spawn([process.execPath,cli,'--config-dir',f.root,'send','--id',f.id,'--pid',String(process.pid),'--text','hello','--wait','60'],{stdout:'pipe',stderr:'pipe'});
+test('interrupting a standalone waiter leaves its receiving inbox available', () => fixture(async f=>{
+  const sent=await f.send('hello','--wait','0'),request=sent.data.request;
+  const child=Bun.spawn([process.execPath,cli,'wait','--request',request,'--timeout','60'],{stdout:'pipe',stderr:'pipe'});
   try{
-    for(let n=0;n<100&&!f.received.length&&child.exitCode===null;n++)await Bun.sleep(10);
     expect(f.received).toHaveLength(1);
     const address=JSON.parse(f.received[0]).from.slice(4),directory=address.slice(0,address.lastIndexOf('/'));
-    expect(existsSync(address)).toBe(true);child.kill('SIGTERM');expect(await child.exited).toBe(143);
-    expect(existsSync(address)).toBe(false);expect(existsSync(directory)).toBe(false);expect(f.connections()).toBe(1);
+    expect(existsSync(address)).toBe(true);child.kill('SIGTERM');await child.exited;
+    expect(existsSync(address)).toBe(true);expect(f.connections()).toBe(1);
+    expect((await f.run(['close','--request',request])).code).toBe(0);
+    expect(existsSync(address)).toBe(false);expect(existsSync(directory)).toBe(false);
   }finally{if(child.exitCode===null)child.kill();await child.exited}
 }));
 
@@ -416,3 +420,69 @@ for(const frame of [{status:'expired',status_detail:'refused'},{status:'denied'}
     const sent=JSON.parse(text);postReply(sent.from,[{type:'control',from:'uds:'+path,action:'peer_message_status',orig_msg_id:sent.msg_id,...frame}]);
   }}));
 }
+
+test('two timeouts can be followed by a cached reply without another send',()=>fixture(async f=>{
+  const first=await f.send('Answer later','--wait','1'),request=first.data.request;
+  expect(first.code).toBe(2);expect(first.data.reply.status).toBe('timeout');
+  const second=await f.run(['wait','--request',request,'--timeout','1']);
+  expect(second.data.reply.status).toBe('timeout');expect(second.data.expiresAt).toBe(first.data.expiresAt);
+  const sent=JSON.parse(f.received[0]),directory=request.slice(0,request.lastIndexOf('/'));
+  await new Promise((resolve,reject)=>{
+    const watcher=watch(directory,()=>{if(existsSync(join(directory,'reply.json'))){clearTimeout(timer);watcher.close();resolve()}});
+    const timer=setTimeout(()=>{watcher.close();reject(Error('Reply was not cached'))},2000);
+    postReply(sent.from,[{type:'user',from:'uds:'+f.socketPath,msg_id:'late-reply',message:{role:'user',content:'Late but retained'}}]);
+  });
+  expect(existsSync(sent.from.slice(4))).toBe(false);
+  for(let i=0;i<2;i++){
+    const result=await f.run(['wait','--request',request,'--timeout','1']);
+    expect(result.code).toBe(0);expect(result.data.reply).toMatchObject({status:'received',messageId:'late-reply',text:'Late but retained'});
+  }
+  expect(f.connections()).toBe(1);
+}));
+
+test('standalone wait observes a live receiver event after send returns immediately',()=>fixture(async f=>{
+  const sent=await f.send('Async request','--wait','0');expect(sent.code).toBe(0);expect(sent.data.reply.status).toBe('pending');
+  const pending=f.run(['wait','--request',sent.data.request,'--timeout','2']),frame=JSON.parse(f.received[0]);
+  setTimeout(()=>postReply(frame.from,[{type:'user',from:'uds:'+f.socketPath,message:{role:'user',content:'Event received'}}]),100);
+  const result=await pending;expect(result.code).toBe(0);expect(result.data.reply.text).toBe('Event received');expect(f.connections()).toBe(1);
+}));
+
+test('receiver lifetime expires independently of wait duration',()=>fixture(async f=>{
+  const sent=await f.send('No reply','--wait','0','--reply-ttl','1'),frame=JSON.parse(f.received[0]);
+  const waited=await f.run(['wait','--request',sent.data.request,'--timeout','2']);
+  expect(waited.code).toBe(2);expect(waited.data.reply.status).toBe('expired');expect(waited.data.expiresAt).toBe(sent.data.expiresAt);
+  expect((await f.run(['close','--request',sent.data.request])).code).toBe(0);
+  expect(existsSync(frame.from.slice(4))).toBe(false);expect(existsSync(sent.data.request)).toBe(false);
+}));
+
+test('failed sends close their receiver without retaining an orphan request',()=>fixture(async f=>{
+  const result=await f.send('x'.repeat(1000000),'--wait','0');
+  expect(result.data.error).toBe('message_too_large');expect(f.connections()).toBe(0);
+  expect(readdirSync(f.root).filter(name=>name.startsWith('ccs-request-')||name.startsWith('ccs-reply-'))).toEqual([]);
+}));
+
+test('close refuses unrelated or symlinked request directories',()=>fixture(async f=>{
+  const unrelated=join(f.root,'keep.json');writeFileSync(unrelated,'important');
+  expect((await f.run(['close','--request',unrelated])).code).toBe(1);expect(readFileSync(unrelated,'utf8')).toBe('important');
+  const sent=await f.send('Pending','--wait','0'),alias=join(f.root,'ccs-request-alias');
+  symlinkSync(sent.data.request.slice(0,sent.data.request.lastIndexOf('/')),alias);
+  expect((await f.run(['close','--request',join(alias,'request.json')])).data.error).toBe('unsafe_request');
+  expect(existsSync(JSON.parse(f.received[0]).from.slice(4))).toBe(true);
+}));
+
+test('a post-submission wait error preserves the handle and receiver',async()=>{
+  let makeUnreadable,request;
+  await fixture(async f=>{
+    makeUnreadable=()=>{
+      const directory=readdirSync(f.root).find(name=>name.startsWith('ccs-request-'));
+      request=join(f.root,directory,'request.json');chmodSync(request,0o644);
+    };
+    const result=await f.send('Keep receiving','--wait','1');
+    chmodSync(request,0o600);
+    expect(result.data.error).toBe('unsafe_request');expect(result.data.request).toBeDefined();
+    const sent=JSON.parse(f.received[0]);expect(existsSync(sent.from.slice(4))).toBe(true);
+    postReply(sent.from,[{type:'user',from:'uds:'+f.socketPath,message:{role:'user',content:'Recovered after wait error'}}]);
+    const recovered=await f.run(['wait','--request',result.data.request,'--timeout','2']);
+    expect(recovered.data.reply.text).toBe('Recovered after wait error');expect(f.connections()).toBe(1);
+  },{onMessage:()=>makeUnreadable()});
+});

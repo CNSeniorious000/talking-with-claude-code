@@ -8,4 +8,4 @@ bunx skills add CNSeniorious000/talking-with-claude-code
 
 See [SKILL.md](SKILL.md). No MCP server, Claude relay process, or runtime dependencies. macOS and Linux; native Windows and cross-machine delivery are not supported.
 
-A send confirms submission only. Add `--wait 60` to open a temporary inbox and await Claude's native `SendMessage` reply. The receiving session's inbound policy still applies.
+A send confirms submission only. Add `--wait 60` to await Claude's native `SendMessage` reply, or `--wait 0` to return immediately. Resume with `wait --request <returned-path> --timeout 60`; timeouts leave the inbox active and late replies are cached. Receivers expire after one hour by default. Use `close --request <path>` to stop receiving and remove cached state. The receiving session's inbound policy still applies.
