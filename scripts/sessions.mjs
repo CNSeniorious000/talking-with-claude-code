@@ -16,7 +16,7 @@ class Failure extends Error { constructor(code, message) { super(message); this.
 const fail = (code, message) => { throw new Failure(code, message); };
 const missing = e => e.code === 'ENOENT' || e.code === 'ESRCH';
 const normalize = s => String(s).trim().replace(/\s+/g, ' ');
-const options = {id:{type:'string'},pid:{type:'string'},text:{type:'string'},wait:{type:'string'},request:{type:'string'},channel:{type:'string'},name:{type:'string'},ttl:{type:'string'},timeout:{type:'string'},'message-id':{type:'string'},'reply-ttl':{type:'string'},'sender-mode':{type:'string'},tail:{type:'string'},'max-chars':{type:'string'},before:{type:'string'},after:{type:'string'},events:{type:'boolean'},'no-preview':{type:'boolean'},'config-dir':{type:'string'},help:{type:'boolean'}};
+const options = {id:{type:'string'},pid:{type:'string'},text:{type:'string'},wait:{type:'string'},request:{type:'string'},channel:{type:'string'},name:{type:'string'},ttl:{type:'string'},timeout:{type:'string'},until:{type:'string'},'message-id':{type:'string'},'reply-ttl':{type:'string'},'sender-mode':{type:'string'},tail:{type:'string'},'max-chars':{type:'string'},before:{type:'string'},after:{type:'string'},events:{type:'boolean'},'no-preview':{type:'boolean'},'config-dir':{type:'string'},help:{type:'boolean'}};
 let args,positionals,command,root;
 const number = (name, fallback, max) => { const value=args[name]===undefined?fallback:Number(args[name]); if(!Number.isSafeInteger(value)||value<0||value>max)fail('invalid_argument',`--${name} must be an integer between 0 and ${max}`); return value; };
 function sessionId() { if(!UUID.test(args.id||''))fail('invalid_argument','--id requires a full session UUID'); return args.id; }
@@ -318,7 +318,7 @@ async function main() {
     'send --channel PATH --text TEXT [--message-id UUID]',
     'status --channel PATH --message-id UUID',
     'wait --request PATH [--timeout SECONDS]',
-    'wait --channel PATH [--after CURSOR --timeout SECONDS]',
+    'wait --channel PATH [--after CURSOR --timeout SECONDS --until reply]',
     'follow --channel PATH [--after CURSOR]',
     'close (--channel PATH | --request PATH)'
   ],configDir:root};
@@ -328,6 +328,7 @@ async function main() {
   if(args.wait!==undefined&&command!=='send')fail('invalid_argument','--wait is only supported by send');
   if(args['reply-ttl']!==undefined&&(command!=='send'||args.wait===undefined))fail('invalid_argument','--reply-ttl requires send --wait');
   if(args.timeout!==undefined&&command!=='wait')fail('invalid_argument','--timeout is only supported by wait');
+  if(args.until!==undefined&&(args.until!=='reply'||command!=='wait'||!args.channel))fail('invalid_argument','--until reply requires wait --channel');
   if(args['sender-mode']!==undefined&&!['send','open'].includes(command))fail('invalid_argument','--sender-mode is only supported by send or open');
   if((args.name!==undefined||args.ttl!==undefined)&&command!=='open')fail('invalid_argument','--name and --ttl are only supported by open');
   if(args.channel!==undefined){
@@ -346,9 +347,27 @@ async function main() {
   if(command==='follow'&&!args.channel)fail('invalid_argument','follow requires --channel');
   if(args.channel&&['wait','follow'].includes(command)){
     let after=args.after||'0';const timeout=number('timeout',60,3600);if(!timeout)fail('invalid_argument','--timeout must be between 1 and 3600 seconds');
+    const untilReply=args.until==='reply',deadline=performance.now()+timeout*1000,receipts=[];let lastResult;
     if(command==='follow')process.stdout.on('error',e=>{if(e.code==='EPIPE')process.exit(0);throw e});
     do{
-      const result=await waitChannel(args.channel,after,timeout,validateTarget);
+      // Receipt traffic must not renew the caller's deadline or masquerade as a model answer.
+      let result;
+      try{result=await waitChannel(args.channel,after,untilReply?Math.max(0,(deadline-performance.now())/1000):timeout,validateTarget)}
+      catch(e){
+        if(!untilReply||!lastResult||e.code!=='ENOENT')throw e;
+        // close can remove the request between receipt reads; retain those receipts without masking an unsafe existing path.
+        try{lstatSync(args.channel)}catch(removed){if(removed.code!=='ENOENT')throw removed;result={...lastResult,reply:{status:'closed'}}}
+        if(!result)throw e;
+      }
+      lastResult=result;
+      if(untilReply){
+        if(result.reply.kind==='receipt'){
+          receipts.push(result.reply);after=result.cursor;
+          if(!(result.reply.receipt.correlated&&result.reply.receipt.status==='refused'))continue;
+        }
+        if(result.reply.status!=='received')process.exitCode=2;
+        return {...result,receipts};
+      }
       if(command==='wait'){if(!['received','receipt'].includes(result.reply.status))process.exitCode=2;return result}
       if(result.reply.status==='timeout')continue;
       console.log(JSON.stringify(result));

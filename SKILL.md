@@ -35,18 +35,19 @@ bun <skill-dir>/scripts/sessions.mjs open --id <session-uuid> --pid <pid> --name
 bun <skill-dir>/scripts/sessions.mjs send --channel <path> --text - <<'MESSAGE'
 <self-contained message>
 MESSAGE
-bun <skill-dir>/scripts/sessions.mjs wait --channel <path> --after 0 --timeout 60
+bun <skill-dir>/scripts/sessions.mjs wait --channel <path> --after 0 --until reply --timeout 60
 bun <skill-dir>/scripts/sessions.mjs follow --channel <path> --after <returned-cursor>
 ```
 
 - `open` binds the target without sending. Retain its `channel` handle. `--name` is an unverified display label, 1–64 visible characters; never use it for routing. Messages instruct Claude to reply only to the exact return address, without substituting another session if it fails.
-- Reuse the channel for multiple sends and receives. Run `wait` for one event or `follow` for a stream. Reads are event-driven; the inbox buffers messages between reads. Neither the inbox nor installing this skill automatically wakes an idle agent.
+- Reuse the channel for multiple sends and receives. Prefer `wait --until reply` for an answer: it waits through delivery receipts within one timeout and returns them in `receipts[]`; a correlated refusal returns immediately with exit code 2. Repeat with the returned cursor for each expected reply. Plain `wait` returns one event; `follow` streams events. Reads are event-driven and buffered between calls; an inbox does not wake an idle agent.
 - Start at `--after 0`; save and reuse the exact returned `cursor` after processing. Cursors bind to the channel; cross-channel, future and bare positive sequence values are rejected. Repeating a cursor replays events without consuming them.
 - Inspect each event: receipts describe delivery; replies contain model messages. Only `receipt.correlated: true` matches a recorded outgoing message. A refusal affects that message and leaves the channel open. Answers are not automatically correlated to individual sends. Neither a receipt nor exit code 0 proves task completion.
 - A `held` receipt is intermediate, not a reason to stop waiting or evidence that sender mode is wrong. Advance to its returned cursor and call `wait` again on the same channel until the requested replies, a terminal status or the waiting deadline. On timeout, retain the handle and report what is pending. Do not reopen, change sender mode or resend to get past a hold.
 - If send returns `queued`, retain `messageId` and query `status --channel <path> --message-id <uuid>`. For an explicit retry, supply `--message-id <uuid>` on the first send and reuse it with identical text. Concurrent retries share one job; changed content fails with `idempotency_conflict`. Never generate a new ID merely because a wait timed out.
 - Use `channels` to recover retained handles for the current temporary directory and Claude config. It reports target, name, address, expiry and lifecycle status without reading messages or connecting to sockets; it excludes one-reply requests.
 - Channels expire after one hour; set `open --ttl <seconds>` up to 86400. Waits do not extend expiry. Keep the channel open while further messages are expected. When finished, run `close --channel <path>`; this deletes cached state and returns IDs of queued messages never attempted. Resolve uncertain sends before closing.
+- Call `wait` before reporting an expired channel; use its lifecycle result, not a comparison between the conversation date and UTC timestamps. Cached replies remain readable after expiry.
 - Drain cached events before handling terminal status. A queue holds at most 256 events or 16 MiB; overflow terminates with `queue_full`. A full outgoing journal rejects new sends with `outgoing_full`. Drain and close it before opening another channel. A restarted target also requires a newly verified channel.
 - Legacy channels use numeric cursors and reply-only queues. Open a new channel for delivery receipts, status queries and idempotent retries.
 

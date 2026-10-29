@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, watch, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, watch, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createConnection, createServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
@@ -680,6 +680,101 @@ test('unmatched receipts remain visibly uncorrelated and status transitions shar
   expect(replies.map(r=>[r.seq,r.receipt.status,r.receipt.correlated])).toEqual([[1,'refused',false],[2,'held',true],[3,'delivered',true]]);
   expect((await f.run(['wait','--channel',channel,'--after',cursor,'--timeout','1'])).data.reply.status).toBe('timeout');
 }));
+
+test('reply waits retain delivery receipts and replay without consuming later answers',()=>fixture(async f=>{
+  const {channel,address}=(await openTestChannel(f)).data,sent=await f.run(['send','--channel',channel,'--text','two updates']);
+  const receipt=status=>({type:'control',from:'uds:'+f.socketPath,action:'peer_message_status',orig_msg_id:sent.data.messageId,status});
+  postReply(address,[receipt('held'),receipt('delivered'),channelFrame(f,'one'),channelFrame(f,'two')]);
+  const first=await f.run(['wait','--channel',channel,'--until','reply','--timeout','2']);
+  expect(first.code).toBe(0);expect(first.data.reply).toMatchObject({status:'received',seq:3,text:'one'});
+  expect(first.data.receipts.map(r=>[r.seq,r.receipt.status,r.receipt.correlated])).toEqual([[1,'held',true],[2,'delivered',true]]);
+  const replay=await f.run(['wait','--channel',channel,'--after','0','--until','reply','--timeout','1']);
+  expect(replay.data).toEqual(first.data);
+  const second=await f.run(['wait','--channel',channel,'--after',first.data.cursor,'--until','reply','--timeout','1']);
+  expect(second.data.reply).toMatchObject({seq:4,text:'two'});expect(second.data.receipts).toEqual([]);
+  expect((await f.run(['wait','--channel',channel,'--after','0','--timeout','1'])).data.reply.receipt.status).toBe('held');
+  expect(f.connections()).toBe(1);expect(existsSync(channel)).toBe(true);
+}));
+
+test('reply waits share one deadline across receipt traffic and can resume afterward',()=>fixture(async f=>{
+  const {channel,address}=(await openTestChannel(f)).data;
+  const receipt=()=>postReply(address,[{type:'control',from:'uds:'+f.socketPath,action:'peer_message_status',orig_msg_id:randomUUID(),status:'held'}]);
+  receipt();const timer=setInterval(receipt,120),guard=setTimeout(()=>clearInterval(timer),3500),started=performance.now();
+  let result;try{result=await f.run(['wait','--channel',channel,'--until','reply','--timeout','1'])}finally{clearInterval(timer);clearTimeout(guard)}
+  expect(result.code).toBe(2);expect(result.data.reply.status).toBe('timeout');expect(result.data.receipts.length).toBeGreaterThan(1);
+  expect(performance.now()-started).toBeLessThan(2500);expect(result.data.cursor).toBe(cursorAt(channel,result.data.receipts.at(-1).seq));
+  postReply(address,[channelFrame(f,'late answer')]);
+  const continued=await f.run(['wait','--channel',channel,'--after',result.data.cursor,'--until','reply','--timeout','2']);
+  expect(continued.code).toBe(0);expect(continued.data.reply.text).toBe('late answer');expect(f.connections()).toBe(0);
+}),10000);
+
+test('reply waits stop on correlated refusal but leave the channel and later replies available',()=>fixture(async f=>{
+  const {channel,address}=(await openTestChannel(f)).data,sent=await f.run(['send','--channel',channel,'--text','check refusal']);
+  const receipt=(id,status)=>({type:'control',from:'uds:'+f.socketPath,action:'peer_message_status',orig_msg_id:id,status});
+  postReply(address,[receipt(randomUUID(),'refused'),receipt(sent.data.messageId,'held'),receipt(sent.data.messageId,'refused'),channelFrame(f,'a later update')]);
+  const result=await f.run(['wait','--channel',channel,'--until','reply','--timeout','2']);
+  expect(result.code).toBe(2);expect(result.data.reply.receipt).toMatchObject({status:'refused',correlated:true,messageId:sent.data.messageId});
+  expect(result.data.receipts.map(r=>r.receipt.correlated)).toEqual([false,true,true]);expect(result.data.reply.seq).toBe(3);
+  const next=await f.run(['wait','--channel',channel,'--after',result.data.cursor,'--until','reply','--timeout','1']);
+  expect(next.code).toBe(0);expect(next.data.reply.text).toBe('a later update');expect(existsSync(channel)).toBe(true);expect(f.connections()).toBe(1);
+}));
+
+test('reply waits retain receipts when the channel closes and reject invalid flag combinations',()=>fixture(async f=>{
+  const {channel,address}=(await openTestChannel(f)).data;
+  for(const args of [['wait','--channel',channel,'--until','receipt'],['follow','--channel',channel,'--until','reply'],['wait','--request',channel,'--until','reply']])
+    expect((await f.run(args)).data.error).toBe('invalid_argument');
+  postReply(address,[{type:'control',from:'uds:'+f.socketPath,action:'peer_message_status',orig_msg_id:randomUUID(),status:'held'}]);
+  const pending=f.run(['wait','--channel',channel,'--until','reply','--timeout','3']);
+  await Bun.sleep(200);expect((await f.run(['close','--channel',channel])).code).toBe(0);
+  const result=await pending;expect(result.code).toBe(2);expect(['closed','cancelled']).toContain(result.data.reply.status);
+  expect(result.data.receipts).toHaveLength(1);expect(result.data.receipts[0].receipt.status).toBe('held');expect(f.connections()).toBe(0);
+}));
+
+
+const waitForChannelShutdown=channel=>new Promise((resolve,reject)=>{
+  const directory=channel.slice(0,channel.lastIndexOf('/')),check=()=>{if(existsSync(join(directory,'done.json'))){clearTimeout(timer);observer.close();resolve()}};
+  const observer=watch(directory,check),timer=setTimeout(()=>{observer.close();reject(Error('Channel did not terminate'))},5000);check();
+});
+
+test('reply waits accept legacy reply-only queues and preserve numeric cursors',()=>fixture(async f=>{
+  // A retained pre-event-log channel has no channel ID, kind field, outgoing journal or live receiver.
+  const directory=realpathSync(mkdtempSync(join(f.root,'ccs-request-'))),channel=join(directory,'request.json');
+  chmodSync(directory,0o700);
+  const put=(name,data)=>writeFileSync(join(directory,name),JSON.stringify(data),{mode:0o600});
+  put('request.json',{kind:'claude-code-reply',version:1,directory,expiresAt:'2000-01-01T00:00:00.000Z',row:{...JSON.parse(readFileSync(f.registry)),registryFile:f.registry},socket:{path:f.socketPath},channel:{name:'legacy'}});
+  put('ready.json',{address:'uds:'+f.socketPath});put('messages.json',[{seq:1,status:'received',text:'retained legacy answer'}]);
+  put('reply.json',{status:'expired'});put('done.json',{closedAt:'2000-01-01T00:00:00.000Z'});
+  const answer=await f.run(['wait','--channel',channel,'--until','reply','--timeout','1']);
+  expect(answer.code).toBe(0);expect(answer.data.reply).toEqual({seq:1,status:'received',text:'retained legacy answer'});
+  expect(answer.data.receipts).toEqual([]);expect(answer.data.cursor).toBe('1');
+  const ended=await f.run(['wait','--channel',channel,'--after',answer.data.cursor,'--until','reply','--timeout','1']);
+  expect(ended.code).toBe(2);expect(ended.data.reply.status).toBe('expired');expect(ended.data.cursor).toBe('1');expect(f.connections()).toBe(0);
+}));
+
+test('reply waits drain cached answers and trailing receipts before reporting expiry',()=>fixture(async f=>{
+  const {channel,address}=(await openTestChannel(f,'--ttl','1')).data;
+  const receipt=status=>({type:'control',from:'uds:'+f.socketPath,action:'peer_message_status',orig_msg_id:randomUUID(),status});
+  postReply(address,[receipt('held'),channelFrame(f,'answer before expiry'),receipt('delivered')]);
+  await waitForChannelShutdown(channel);
+  const answer=await f.run(['wait','--channel',channel,'--until','reply','--timeout','1']);
+  expect(answer.code).toBe(0);expect(answer.data.reply).toMatchObject({seq:2,text:'answer before expiry'});
+  expect(answer.data.receipts.map(r=>[r.seq,r.receipt.status])).toEqual([[1,'held']]);
+  const ended=await f.run(['wait','--channel',channel,'--after',answer.data.cursor,'--until','reply','--timeout','1']);
+  expect(ended.code).toBe(2);expect(ended.data.reply.status).toBe('expired');expect(ended.data.cursor).toBe(cursorAt(channel,3));
+  expect(ended.data.receipts.map(r=>[r.seq,r.receipt.status])).toEqual([[3,'delivered']]);expect(f.connections()).toBe(0);
+}),10000);
+
+test('reply waits preserve every accepted receipt before reporting queue overflow',()=>fixture(async f=>{
+  const {channel,address}=(await openTestChannel(f)).data;
+  postReply(address,Array.from({length:257},()=>({type:'control',from:'uds:'+f.socketPath,action:'peer_message_status',orig_msg_id:randomUUID(),status:'held'})));
+  await waitForChannelShutdown(channel);
+  const ended=await f.run(['wait','--channel',channel,'--until','reply','--timeout','2']);
+  expect(ended.code).toBe(2);expect(ended.data.reply.status).toBe('queue_full');expect(ended.data.cursor).toBe(cursorAt(channel,256));
+  expect(ended.data.receipts.map(r=>r.seq)).toEqual(Array.from({length:256},(_,i)=>i+1));
+  expect(ended.data.receipts.every(r=>r.receipt.status==='held'&&r.receipt.correlated===false)).toBe(true);
+  const replay=await f.run(['wait','--channel',channel,'--after','0','--timeout','1']);
+  expect(replay.code).toBe(0);expect(replay.data.reply.seq).toBe(1);expect(f.connections()).toBe(0);
+}),10000);
 
 test('a channel rejects future, unbound and cross-channel cursors',()=>fixture(async f=>{
   const a=(await openTestChannel(f)).data,b=(await openTestChannel(f)).data;
