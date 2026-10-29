@@ -5,18 +5,18 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { createConnection } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { startReply, receiveReply, waitReply, closeReply, loadChannel, waitChannel } from './reply-store.mjs';
+import { startReply, receiveReply, waitReply, closeReply, loadChannel, waitChannel, sendChannel, outgoingStatus } from './reply-store.mjs';
+import { writeFrame } from './transport.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 class Failure extends Error { constructor(code, message) { super(message); this.code = code; } }
 const fail = (code, message) => { throw new Failure(code, message); };
 const missing = e => e.code === 'ENOENT' || e.code === 'ESRCH';
 const normalize = s => String(s).trim().replace(/\s+/g, ' ');
-const options = {id:{type:'string'},pid:{type:'string'},text:{type:'string'},wait:{type:'string'},request:{type:'string'},channel:{type:'string'},name:{type:'string'},ttl:{type:'string'},timeout:{type:'string'},'reply-ttl':{type:'string'},'sender-mode':{type:'string'},tail:{type:'string'},'max-chars':{type:'string'},before:{type:'string'},after:{type:'string'},events:{type:'boolean'},'config-dir':{type:'string'},help:{type:'boolean'}};
+const options = {id:{type:'string'},pid:{type:'string'},text:{type:'string'},wait:{type:'string'},request:{type:'string'},channel:{type:'string'},name:{type:'string'},ttl:{type:'string'},timeout:{type:'string'},'message-id':{type:'string'},'reply-ttl':{type:'string'},'sender-mode':{type:'string'},tail:{type:'string'},'max-chars':{type:'string'},before:{type:'string'},after:{type:'string'},events:{type:'boolean'},'config-dir':{type:'string'},help:{type:'boolean'}};
 let args,positionals,command,root;
 const number = (name, fallback, max) => { const value=args[name]===undefined?fallback:Number(args[name]); if(!Number.isSafeInteger(value)||value<0||value>max)fail('invalid_argument',`--${name} must be an integer between 0 and ${max}`); return value; };
 function sessionId() { if(!UUID.test(args.id||''))fail('invalid_argument','--id requires a full session UUID'); return args.id; }
@@ -249,8 +249,10 @@ function socketIdentity(row) {
   return {path:socket,ino:stat.ino,dev:stat.dev};
 }
 function validateTarget(row,socket){
-  const current=readRegistration(row.registryFile),now=socketIdentity(current);
-  if(current.sessionId!==row.sessionId||current.procStart!==row.procStart||now.path!==socket.path||now.ino!==socket.ino||now.dev!==socket.dev)fail('target_changed','Session or socket identity changed');
+  try{
+    const current=readRegistration(row.registryFile),now=socketIdentity(current);
+    if(current.sessionId!==row.sessionId||current.procStart!==row.procStart||now.path!==socket.path||now.ino!==socket.ino||now.dev!==socket.dev)fail('target_changed','Session or socket identity changed');
+  }catch(e){if(missing(e)||e.code==='process_changed')fail('target_changed','Target session exited or its process identity changed; verify a new target');throw e}
 }
 function permissionMode(){
   const senderMode=args['sender-mode'];if(senderMode!==undefined&&!['bypass','prompting'].includes(senderMode))fail('invalid_argument','--sender-mode must be bypass or prompting');
@@ -265,8 +267,8 @@ async function openChannel(){
   const name=args.name;
   if(!name||name!==name.trim()||[...name].length>64||/["<>\p{C}\p{Zl}\p{Zp}]/u.test(name))fail('invalid_argument','--name requires 1–64 visible characters without quotes or angle brackets');
   const senderMode=permissionMode(),ttl=number('ttl',3600,86400);if(!ttl)fail('invalid_argument','--ttl must be between 1 and 86400 seconds');
-  const {row,socket}=target(),inbox=await startReply(fileURLToPath(import.meta.url),row,socket,null,ttl,{name,senderMode});
-  return {status:'open',channel:inbox.request,address:inbox.address,name,sessionId:row.sessionId,pid:row.pid,expiresAt:inbox.expiresAt};
+  const channelId=randomUUID(),{row,socket}=target(),inbox=await startReply(fileURLToPath(import.meta.url),row,socket,null,ttl,{id:channelId,name,senderMode});
+  return {status:'open',channel:inbox.request,channelId,cursor:channelId+':0',address:inbox.address,name,sessionId:row.sessionId,pid:row.pid,expiresAt:inbox.expiresAt};
 }
 async function send() {
   const channel=args.channel?loadChannel(args.channel,{active:true}):null;
@@ -274,48 +276,45 @@ async function send() {
   if(args.text===undefined)fail('invalid_argument','--text is required; use --text - to read stdin');
   const text=args.text==='-'?await Bun.stdin.text():args.text;if(!text.trim())fail('invalid_argument','Message must not be empty');
   const wait=number('wait',0,3600),ttl=number('reply-ttl',3600,86400);if(!ttl)fail('invalid_argument','--reply-ttl must be between 1 and 86400 seconds');
-  validateTarget(row,socket);const msgId=randomUUID();
-  let cursor=null;try{cursor=(await conversation(id,true)).messages.at(-1)?.id||null}catch(e){if(e.code!=='transcript_missing')throw e}
+  if(args['message-id']&&!channel?.data.channel.id)fail('invalid_argument','Idempotent sends require a newly opened channel');
+  validateTarget(row,socket);const msgId=args['message-id']?.toLowerCase()||randomUUID();
+  let cursor=null;if(!channel)try{cursor=(await conversation(id,true)).messages.at(-1)?.id||null}catch(e){if(e.code!=='transcript_missing')throw e}
   const inbox=channel?{request:channel.request,expiresAt:channel.data.expiresAt,address:channel.ready.address}:args.wait!==undefined?await startReply(fileURLToPath(import.meta.url),row,socket,msgId,ttl):null;
   let sent=false;
   try{
   // Native origin.from is not shown to the model. An explicit wrapper makes its return address actionable.
   const wrapped=!!inbox||senderMode!==undefined,attributes=(inbox?` from="${inbox.address}"`:'')+(name?` from-name="${name}"`:'')+(senderMode?` from-mode="${senderMode}"`:'');
-  const routing=inbox?`\n\nReply using SendMessage only to the exact from address above. This is an external agent, not a Claude session discoverable through ListAgents; the display name is not a routing target. Never substitute another session or infer a target from its name. If this address fails, report the failure here instead.${channel?` This channel can receive multiple messages until ${inbox.expiresAt}, unless explicitly closed.`:' This is a one-reply inbox; it closes after your first reply.'}`:'';
+  const routing=inbox?`\n\nReply using SendMessage only to the exact from address above. This is an external agent, not a Claude session discoverable through ListAgents; the display name is caller-declared and unverified, not an identity credential or routing target. Never substitute another session or infer a target from its name. If this address fails, report the failure here instead.${channel?` This channel can receive multiple messages until ${inbox.expiresAt}, unless explicitly closed.`:' This is a one-reply inbox; it closes after your first reply.'}`:'';
   const body=wrapped?`<cross-session-message${attributes}>\n${text}${routing}\n</cross-session-message>`:text;
   const payload=JSON.stringify({type:'user',session_id:id,uuid:msgId,msg_id:msgId,...wrapped&&{msgV:1},from:inbox?.address||'external-agent',message:{role:'user',content:body}})+'\n';
   if(payload.length>1000000)fail('message_too_large','Serialized message exceeds 1,000,000 characters');
-  let deadline;
-  await new Promise((resolve,reject)=>{
-    let submitted=false,attempted=false;
-    const client=createConnection({path:socket.path},()=>{
-      try {
-        // Discovery is a snapshot. Revalidate after connect, before any bytes leave.
-        validateTarget(row,socket);
-        if(channel)loadChannel(args.channel,{active:true});
-        attempted=true;
-        // Bun can finish end(data) after a short write. Flush explicitly and check its byte count before closing.
-        client.write(payload,error=>{if(error||client.bytesWritten<Buffer.byteLength(payload)){client.destroy(error||new Failure('outcome_unknown','Write interrupted; inspect the recipient before retrying'));return;}submitted=true;client.end();});
-      }catch(e){client.destroy(e)}
-    });
-    // A half-closed, backpressured Bun socket may never emit its inactivity timeout or finish the write callback.
-    deadline=setTimeout(()=>{reject(new Failure(attempted?'outcome_unknown':'socket_timeout',attempted?'Bytes may have been written; inspect the recipient before retrying':'Socket timed out'));client.destroy();},5000);
-    client.on('error',e=>reject(attempted?new Failure('outcome_unknown','Connection failed after a write attempt; inspect the recipient before retrying'):e));
-    client.on('data',()=>{});client.on('close',error=>{if(!error){if(submitted)resolve();else reject(new Failure(attempted?'outcome_unknown':'not_submitted','Connection closed before write completed; inspect the recipient before retrying'));}});
-  }).finally(()=>clearTimeout(deadline));
+  let outcome;
+  if(channel?.data.channel.id)outcome=await sendChannel(args.channel,payload,msgId);
+  else await writeFrame(socket,payload,()=>{validateTarget(row,socket);if(channel)loadChannel(args.channel,{active:true})});
   sent=true;
-  const result={status:'submitted',acceptance:'unconfirmed',sessionId:id,pid,messageId:msgId,cursor,sentAt:new Date().toISOString(),note:'Read the recipient transcript to verify receipt or completion. Do not infer either from this write.'};
-  if(channel){Object.assign(result,{channel:channel.request,address:inbox.address,name,expiresAt:inbox.expiresAt});result.note='Use wait or follow --channel with the last received seq as --after. Receiving a reply does not close this channel.'}
+  const result={status:outcome?.status||'submitted',acceptance:'unconfirmed',sessionId:id,pid,messageId:msgId,cursor,...outcome?.queuedAt&&{queuedAt:outcome.queuedAt},...outcome?.status!=='queued'&&{sentAt:new Date().toISOString()},note:'Read the recipient transcript to verify receipt or completion. Do not infer either from this write.'};
+  if(channel){Object.assign(result,{channel:channel.request,address:inbox.address,name,expiresAt:inbox.expiresAt});result.note='Use wait or follow --channel with its returned cursor as --after. Receipt events describe delivery, not task completion. Receiving an event does not close the channel.'}
   else if(inbox){Object.assign(result,await waitReply(inbox.request,wait));result.note='Wait again with the same request; do not resend. The receiver stops on reply or expiry, and close --request removes cached state.';if(!['received','pending'].includes(result.reply.status))process.exitCode=2;}
   return result;
   }catch(e){
-    if(channel)Object.assign(e,{channel:channel.request});
+    if(channel)Object.assign(e,{channel:channel.request,messageId:msgId});
     else if(inbox){if(sent||e.code==='outcome_unknown')Object.assign(e,{request:inbox.request,expiresAt:inbox.expiresAt});else await closeReply(inbox.request)}
     throw e;
   }
 }
 async function main() {
-  if(args.help||!command)return {usage:'bun scripts/sessions.mjs list | read --id UUID [--tail N --max-chars N --before UUID --after UUID --events] | open --id UUID --pid PID --name NAME [--sender-mode bypass|prompting --ttl SECONDS] | send (--channel PATH | --id UUID --pid PID) --text TEXT [--sender-mode bypass|prompting --wait SECONDS --reply-ttl SECONDS] | wait (--channel PATH [--after SEQ] | --request PATH) [--timeout SECONDS] | follow --channel PATH [--after SEQ] | close (--channel PATH | --request PATH)',configDir:root};
+  if(args.help||!command)return {usage:[
+    'bun scripts/sessions.mjs list',
+    'read --id UUID [--tail N --max-chars N --before UUID --after UUID --events]',
+    'open --id UUID --pid PID --name NAME [--sender-mode bypass|prompting --ttl SECONDS]',
+    'send --id UUID --pid PID --text TEXT [--sender-mode bypass|prompting --wait SECONDS --reply-ttl SECONDS]',
+    'send --channel PATH --text TEXT [--message-id UUID]',
+    'status --channel PATH --message-id UUID',
+    'wait --request PATH [--timeout SECONDS]',
+    'wait --channel PATH [--after CURSOR --timeout SECONDS]',
+    'follow --channel PATH [--after CURSOR]',
+    'close (--channel PATH | --request PATH)'
+  ],configDir:root};
   if(positionals.length!==1)fail('invalid_argument','Unexpected positional arguments; pass message text with --text');
   if(!['darwin','linux'].includes(process.platform))fail('unsupported_platform','Only macOS and Linux Unix sockets are supported');
   if(args.wait!==undefined&&command!=='send')fail('invalid_argument','--wait is only supported by send');
@@ -324,24 +323,29 @@ async function main() {
   if(args['sender-mode']!==undefined&&!['send','open'].includes(command))fail('invalid_argument','--sender-mode is only supported by send or open');
   if((args.name!==undefined||args.ttl!==undefined)&&command!=='open')fail('invalid_argument','--name and --ttl are only supported by open');
   if(args.channel!==undefined){
-    if(!['send','wait','follow','close'].includes(command))fail('invalid_argument','--channel is only supported by send, wait, follow or close');
+    if(!['send','wait','follow','close','status'].includes(command))fail('invalid_argument','--channel is only supported by send, wait, follow, close or status');
     if(['id','pid','request','wait','sender-mode'].some(key=>args[key]!==undefined))fail('invalid_argument','A channel fixes its target and identity; do not combine it with --id, --pid, --request, --wait or --sender-mode');
+  }
+  if(args['message-id']!==undefined&&(!args.channel||!['send','status'].includes(command)||!UUID.test(args['message-id'])))fail('invalid_argument','--message-id requires send/status --channel and a full UUID');
+  if(command==='status'){
+    if(!args.channel||!args['message-id'])fail('invalid_argument','status requires --channel and --message-id');
+    return outgoingStatus(args.channel,args['message-id'].toLowerCase());
   }
   if(args.after!==undefined&&command!=='read'&&!(args.channel&&['wait','follow'].includes(command)))fail('invalid_argument','--after requires read or channel wait/follow');
   if(command==='_receive'){await receiveReply(args.request,validateTarget);return {status:'closed'}}
   if(command==='open')return openChannel();
-  if(command==='close'){if(args.channel)loadChannel(args.channel);const result=await closeReply(args.channel||args.request);return args.channel?{status:result.status,channel:args.channel}:result}
+  if(command==='close'){if(args.channel)loadChannel(args.channel);const result=await closeReply(args.channel||args.request);return args.channel?{status:result.status,channel:args.channel,...result.undelivered&&{undelivered:result.undelivered}}:result}
   if(command==='follow'&&!args.channel)fail('invalid_argument','follow requires --channel');
   if(args.channel&&['wait','follow'].includes(command)){
-    let after=number('after',0,Number.MAX_SAFE_INTEGER);const timeout=number('timeout',60,3600);if(!timeout)fail('invalid_argument','--timeout must be between 1 and 3600 seconds');
+    let after=args.after||'0';const timeout=number('timeout',60,3600);if(!timeout)fail('invalid_argument','--timeout must be between 1 and 3600 seconds');
     if(command==='follow')process.stdout.on('error',e=>{if(e.code==='EPIPE')process.exit(0);throw e});
     do{
       const result=await waitChannel(args.channel,after,timeout,validateTarget);
-      if(command==='wait'){if(result.reply.status!=='received')process.exitCode=2;return result}
+      if(command==='wait'){if(!['received','receipt'].includes(result.reply.status))process.exitCode=2;return result}
       if(result.reply.status==='timeout')continue;
       console.log(JSON.stringify(result));
-      if(result.reply.status!=='received'){process.exitCode=2;return}
-      after=result.reply.seq;
+      if(!['received','receipt'].includes(result.reply.status)){process.exitCode=2;return}
+      after=result.cursor;
     }while(true);
   }
   if(command==='wait'){
@@ -363,4 +367,4 @@ try {
   ({values:args,positionals}=parseArgs({args:process.argv.slice(2),options,allowPositionals:true}));
   command=positionals[0];root=resolve(args['config-dir']||process.env.CLAUDE_CONFIG_DIR||join(homedir(),'.claude'));
   const result=await main();if(result!==undefined)console.log(JSON.stringify(result,null,2));
-} catch(e) { console.error(JSON.stringify({error:e.code||'failed',message:e.message,...e.request&&{request:e.request,expiresAt:e.expiresAt},...e.channel&&{channel:e.channel}}));process.exitCode=1; }
+} catch(e) { console.error(JSON.stringify({error:e.code||'failed',message:e.message,...e.request&&{request:e.request,expiresAt:e.expiresAt},...e.channel&&{channel:e.channel},...e.messageId&&{messageId:e.messageId}}));process.exitCode=1; }

@@ -513,6 +513,7 @@ test('invalid sender mode is refused before any socket connection',()=>fixture(a
   expect((await f.run(['list','--sender-mode','bypass'])).data.error).toBe('invalid_argument');expect(f.connections()).toBe(0);
 }));
 
+const cursorAt=(channel,seq)=>JSON.parse(readFileSync(channel)).channel.id+':'+seq;
 const openTestChannel=(f,...args)=>f.run(['open','--id',f.id,'--pid',String(process.pid),'--name','Codex · 主任务',...args]);
 const channelFrame=(f,text,id=randomUUID())=>({type:'user',from:'uds:'+f.socketPath,msg_id:id,message:{role:'user',content:text}});
 
@@ -530,11 +531,11 @@ test('a named channel supports multiple sends and replies at one address without
   const first=await f.run(['wait','--channel',channel,'--after','0','--timeout','1']);
   expect(first.data.reply).toMatchObject({seq:1,text:'first'});
   expect(existsSync(address.slice(4))).toBe(true);
-  expect((await f.run(['wait','--channel',channel,'--after','1','--timeout','1'])).data.reply).toMatchObject({seq:2,text:'second'});
-  expect((await f.run(['wait','--channel',channel,'--after','1','--timeout','1'])).data.reply.seq).toBe(2);
-  expect((await f.run(['wait','--channel',channel,'--after','2','--timeout','1'])).data.reply.status).toBe('timeout');
+  expect((await f.run(['wait','--channel',channel,'--after',cursorAt(channel,1),'--timeout','1'])).data.reply).toMatchObject({seq:2,text:'second'});
+  expect((await f.run(['wait','--channel',channel,'--after',cursorAt(channel,1),'--timeout','1'])).data.reply.seq).toBe(2);
+  expect((await f.run(['wait','--channel',channel,'--after',cursorAt(channel,2),'--timeout','1'])).data.reply.status).toBe('timeout');
   postReply(address,[channelFrame(f,'third')]);
-  expect((await f.run(['wait','--channel',channel,'--after','2','--timeout','1'])).data.reply).toMatchObject({seq:3,text:'third'});
+  expect((await f.run(['wait','--channel',channel,'--after',cursorAt(channel,2),'--timeout','1'])).data.reply).toMatchObject({seq:3,text:'third'});
   expect(f.connections()).toBe(2);
 }));
 
@@ -546,7 +547,7 @@ test('channel identity cannot be overridden and invalid display names fail befor
   for(const args of [['--id',randomUUID()],['--pid','1'],['--sender-mode','bypass'],['--wait','1']]){
     expect((await f.run(['send','--channel',channel,'--text','hello',...args])).data.error).toBe('invalid_argument');
   }
-  expect((await f.run(['wait','--channel',channel,'--after=-1'])).data.error).toBe('invalid_argument');
+  expect((await f.run(['wait','--channel',channel,'--after=-1'])).data.error).toBe('invalid_cursor');
   expect((await f.run(['wait','--request',channel])).data.error).toBe('invalid_argument');
   expect(f.connections()).toBe(0);
 }));
@@ -557,7 +558,7 @@ test('channel rejects foreign replies and a replacement target, retaining previo
   expect((await f.run(['wait','--channel',channel,'--timeout','1'])).data.reply.text).toBe('accepted');
   f.registration({sessionId:randomUUID()});
   expect((await f.run(['send','--channel',channel,'--text','must not send'])).data.error).toBe('target_changed');
-  expect((await f.run(['wait','--channel',channel,'--after','1','--timeout','1'])).data.reply.status).toBe('target_changed');
+  expect((await f.run(['wait','--channel',channel,'--after',cursorAt(channel,1),'--timeout','1'])).data.reply.status).toBe('target_changed');
   expect((await f.run(['wait','--channel',channel,'--after','0','--timeout','1'])).data.reply.text).toBe('accepted');
   expect(f.connections()).toBe(0);
 }));
@@ -566,7 +567,7 @@ test('channel expiry preserves cached replies and blocks new sends',()=>fixture(
   const {channel,address}=(await openTestChannel(f,'--ttl','1')).data;
   postReply(address,[channelFrame(f,'before expiry')]);
   expect((await f.run(['wait','--channel',channel,'--timeout','1'])).data.reply.seq).toBe(1);
-  expect((await f.run(['wait','--channel',channel,'--after','1','--timeout','2'])).data.reply.status).toBe('expired');
+  expect((await f.run(['wait','--channel',channel,'--after',cursorAt(channel,1),'--timeout','2'])).data.reply.status).toBe('expired');
   expect((await f.run(['send','--channel',channel,'--text','too late'])).data.error).toBe('channel_closed');
   expect((await f.run(['wait','--channel',channel,'--timeout','1'])).data.reply.text).toBe('before expiry');
 }));
@@ -593,14 +594,85 @@ test('follow streams NDJSON and stopping it leaves the channel available',()=>fi
     child.kill('SIGTERM');await child.exited;
     expect(existsSync(address.slice(4))).toBe(true);
     postReply(address,[channelFrame(f,'three')]);
-    expect((await f.run(['wait','--channel',channel,'--after','2','--timeout','1'])).data.reply.seq).toBe(3);
+    expect((await f.run(['wait','--channel',channel,'--after',cursorAt(channel,2),'--timeout','1'])).data.reply.seq).toBe(3);
   }finally{clearTimeout(guard);reader.releaseLock();if(child.exitCode===null)child.kill();await child.exited}
 }));
 
 test('a full channel queue retains its accepted messages and reports overflow',()=>fixture(async f=>{
   const {channel,address}=(await openTestChannel(f)).data;
   postReply(address,Array.from({length:257},(_,i)=>channelFrame(f,String(i+1))));
-  expect((await f.run(['wait','--channel',channel,'--after','255','--timeout','2'])).data.reply).toMatchObject({seq:256,text:'256'});
-  expect((await f.run(['wait','--channel',channel,'--after','256','--timeout','2'])).data.reply.status).toBe('queue_full');
+  await new Promise((resolve,reject)=>{
+    const directory=channel.slice(0,channel.lastIndexOf('/')),check=()=>{if(existsSync(join(directory,'done.json'))){clearTimeout(timer);observer.close();resolve()}};
+    const observer=watch(directory,check),timer=setTimeout(()=>{observer.close();reject(Error('Queue did not terminate'))},5000);check();
+  });
+  expect((await f.run(['wait','--channel',channel,'--after',cursorAt(channel,255),'--timeout','2'])).data.reply).toMatchObject({seq:256,text:'256'});
+  expect((await f.run(['wait','--channel',channel,'--after',cursorAt(channel,256),'--timeout','2'])).data.reply.status).toBe('queue_full');
   expect((await f.run(['wait','--channel',channel,'--after','0','--timeout','1'])).data.reply.text).toBe('1');
+}),10000);
+
+test('channel receipts correlate before the sender returns and refusal does not close the channel',()=>fixture(async f=>{
+  const {channel,address}=(await openTestChannel(f)).data;
+  const sent=await f.run(['send','--channel',channel,'--text','receive refusal']);
+  const refused=await f.run(['wait','--channel',channel,'--timeout','1']);
+  expect(refused.data.reply).toMatchObject({kind:'receipt',status:'receipt',seq:1,receipt:{status:'refused',messageId:sent.data.messageId,correlated:true}});
+  expect(existsSync(address.slice(4))).toBe(true);
+  const again=await f.run(['send','--channel',channel,'--text','receive reply']);
+  expect(again.code).toBe(0);
+  const delivered=await f.run(['wait','--channel',channel,'--after',refused.data.cursor,'--timeout','1']);
+  expect(delivered.data.reply).toMatchObject({kind:'receipt',receipt:{status:'delivered',correlated:true}});
+  const answer=await f.run(['wait','--channel',channel,'--after',delivered.data.cursor,'--timeout','1']);
+  expect(answer.data.reply).toMatchObject({kind:'reply',seq:3,text:'still open'});
+  expect(f.connections()).toBe(2);
+},{onMessage:(text,path)=>{
+  const sent=JSON.parse(text),refuse=sent.message.content.includes('receive refusal');
+  postReply(sent.from,[{type:'control',from:'uds:'+path,action:'peer_message_status',orig_msg_id:sent.msg_id,status:refuse?'refused':'delivered'},...refuse?[]:[{type:'user',from:'uds:'+path,msg_id:randomUUID(),message:{role:'user',content:'still open'}}]]);
+}}));
+
+test('unmatched receipts remain visibly uncorrelated and status transitions share one event cursor',()=>fixture(async f=>{
+  const {channel,address}=(await openTestChannel(f)).data,sent=await f.run(['send','--channel',channel,'--text','track statuses']);
+  const receipt=(id,status)=>({type:'control',from:'uds:'+f.socketPath,action:'peer_message_status',orig_msg_id:id,status});
+  postReply(address,[receipt(randomUUID(),'refused'),receipt(sent.data.messageId,'held'),receipt(sent.data.messageId,'held'),receipt(sent.data.messageId,'delivered')]);
+  let cursor='0';const replies=[];
+  for(let i=0;i<3;i++){const result=await f.run(['wait','--channel',channel,'--after',cursor,'--timeout','1']);replies.push(result.data.reply);cursor=result.data.cursor}
+  expect(replies.map(r=>[r.seq,r.receipt.status,r.receipt.correlated])).toEqual([[1,'refused',false],[2,'held',true],[3,'delivered',true]]);
+  expect((await f.run(['wait','--channel',channel,'--after',cursor,'--timeout','1'])).data.reply.status).toBe('timeout');
 }));
+
+test('a channel rejects future, unbound and cross-channel cursors',()=>fixture(async f=>{
+  const a=(await openTestChannel(f)).data,b=(await openTestChannel(f)).data;
+  expect((await f.run(['wait','--channel',a.channel,'--after',b.cursor])).data.error).toBe('cursor_mismatch');
+  expect((await f.run(['wait','--channel',a.channel,'--after',a.channelId+':99'])).data.error).toBe('cursor_ahead');
+  expect((await f.run(['wait','--channel',a.channel,'--after','1'])).data.error).toBe('invalid_cursor');
+}));
+
+test('a removed target registration returns target_changed without sending',()=>fixture(async f=>{
+  const {channel}=(await openTestChannel(f)).data;rmSync(f.registry);
+  expect((await f.run(['send','--channel',channel,'--text','must not send'])).data.error).toBe('target_changed');
+  expect(f.connections()).toBe(0);
+}));
+
+test('concurrent retries of a channel message ID send once and expose a queryable result',()=>fixture(async f=>{
+  const {channel}=(await openTestChannel(f)).data,id=randomUUID(),args=['send','--channel',channel,'--message-id',id,'--text','exactly once'];
+  const results=await Promise.all([f.run(args),f.run(args)]);
+  expect(results.map(r=>r.code)).toEqual([0,0]);expect(f.connections()).toBe(1);
+  expect((await f.run(['status','--channel',channel,'--message-id',id])).data).toMatchObject({messageId:id,status:'submitted'});
+  expect((await f.run(['send','--channel',channel,'--message-id',id,'--text','different'])).data.error).toBe('idempotency_conflict');
+  expect(f.connections()).toBe(1);
+}),10000);
+
+test('a paused channel worker returns queued with an ID and later submits the same job once',()=>fixture(async f=>{
+  const {channel}=(await openTestChannel(f)).data,id=randomUUID(),pid=JSON.parse(readFileSync(channel.replace('request.json','ready.json'))).pid;
+  let resumed=false,child;
+  process.kill(pid,'SIGSTOP');
+  try{
+    child=Bun.spawn([process.execPath,cli,'send','--channel',channel,'--message-id',id,'--text','delayed job'],{stdout:'pipe',stderr:'pipe'});
+    const output=new Response(child.stdout).text();
+    expect(await child.exited).toBe(0);const result=JSON.parse(await output);
+    expect(result).toMatchObject({status:'queued',messageId:id});expect(result.queuedAt).toBeString();
+    expect((await f.run(['status','--channel',channel,'--message-id',id])).data.status).toBe('queued');
+    process.kill(pid,'SIGCONT');resumed=true;
+    expect((await f.run(['wait','--channel',channel,'--timeout','2'])).data.reply.text).toBe('resumed');
+    expect((await f.run(['status','--channel',channel,'--message-id',id])).data.status).toBe('submitted');
+    expect(f.connections()).toBe(1);
+  }finally{if(!resumed)process.kill(pid,'SIGCONT');if(child?.exitCode===null)child.kill();if(child)await child.exited}
+},{onMessage:(text,path)=>{const sent=JSON.parse(text);postReply(sent.from,[{type:'user',from:'uds:'+path,message:{role:'user',content:'resumed'}}])}}),20000);
