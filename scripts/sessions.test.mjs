@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { createServer } from 'node:net';
+import { createConnection, createServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
@@ -11,7 +11,7 @@ const procStart = procStat === null ? execFileSync('/bin/ps', ['-p', String(proc
 const turn = (type, text, parentUuid = null, extra = {}) => ({ type, uuid: randomUUID(), parentUuid, timestamp: new Date().toISOString(), message: { role: type, content: text }, ...extra });
 const boundary = (compactMetadata = {}) => ({ type: 'system', subtype: 'compact_boundary', uuid: randomUUID(), parentUuid: null, compactMetadata });
 
-async function fixture(check, { onData } = {}) {
+async function fixture(check, { onData, onMessage } = {}) {
   // A short path avoids macOS's Unix socket path limit; never inspect ~/.claude.
   const root = mkdtempSync('/tmp/ccs-test-'), id = randomUUID(), peers = new Set(), received = [];
   chmodSync(root, 0o700);
@@ -21,7 +21,7 @@ async function fixture(check, { onData } = {}) {
   const server = createServer({ allowHalfOpen: true }, socket => {
     connections++; peers.add(socket); socket.setEncoding('utf8'); let text = '';
     socket.on('data', chunk => { text += chunk; onData?.(socket, chunk); });
-    socket.on('end', () => { received.push(text); socket.end(); });
+    socket.on('end', () => { received.push(text); onMessage?.(text,socketPath); socket.end(); });
     socket.on('error', () => {}); socket.on('close', () => peers.delete(socket));
   });
   const registration = patch => writeFileSync(registry, JSON.stringify({ pid: process.pid, sessionId: id, procStart, cwd: root, name: 'fixture', status: 'idle', messagingSocketPath: socketPath, ...patch }));
@@ -33,7 +33,7 @@ async function fixture(check, { onData } = {}) {
     try {
       child.stdin.write(input); child.stdin.end();
       const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-      return { code, data: JSON.parse(code === 0 ? stdout : stderr) };
+      return { code, data: JSON.parse(stdout || stderr) };
     } finally { clearTimeout(timeout); if (child.exitCode === null) child.kill(); await child.exited; }
   };
   const read = (...args) => run(['read', '--id', id, ...args]);
@@ -316,3 +316,103 @@ test('batch recovery cannot revive messages removed by compaction', () => fixtur
   const read = await f.read('--tail', '0');
   expect(read.data.messages.map(row => row.text)).toEqual(['summary', 'current block']);
 }));
+
+function postReply(address,frames) {
+  const peer=createConnection(address.slice(4),()=>{
+    peer.write(frames.map(frame=>JSON.stringify(frame)).join('\n')+'\n',()=>peer.end());
+  });
+  peer.on('error',()=>{});
+}
+
+test('send --wait receives the first native reply and removes its request-specific inbox', () => fixture(async f=>{
+  const result=await f.send('Explain ORCHID','--wait','2'),sent=JSON.parse(f.received[0]);
+  expect(result.code).toBe(0);expect(result.data.reply.status).toBe('received');expect(result.data.reply.text).toBe('ORCHID uses PostgreSQL');
+  expect(sent.message.content).toContain(`from="${sent.from}"`);expect(sent.message.content).toContain('Explain ORCHID');
+  expect(existsSync(sent.from.slice(4))).toBe(false);expect(f.connections()).toBe(1);
+},{onMessage:(text,path)=>{
+  const sent=JSON.parse(text);
+  postReply(sent.from,[{type:'user',from:'uds:'+path,msg_id:randomUUID(),message:{role:'user',content:'ORCHID uses PostgreSQL'}}]);
+}}));
+
+test('delivery receipts and foreign senders do not satisfy --wait', () => fixture(async f=>{
+  const result=await f.send('Wait for an answer','--wait','1'),sent=JSON.parse(f.received[0]);
+  expect(result.code).toBe(2);expect(result.data.status).toBe('submitted');expect(result.data.reply.status).toBe('timeout');
+  expect(result.data.reply.receipt.status).toBe('delivered');expect(existsSync(sent.from.slice(4))).toBe(false);expect(f.connections()).toBe(1);
+},{onMessage:(text,path)=>{
+  const sent=JSON.parse(text);
+  postReply(sent.from,[
+    {type:'control',from:'uds:'+path,action:'peer_message_status',status:'delivered',orig_msg_id:sent.msg_id},
+    {type:'user',from:sent.from,message:{role:'user',content:'Not the intended sender'}},
+    {type:'user',from:'uds:'+path,message:{role:'user',content:''}}
+  ]);
+}}));
+
+test('a matching refusal returns without resending', () => fixture(async f=>{
+  const result=await f.send('Ask once','--wait','2'),sent=JSON.parse(f.received[0]);
+  expect(result.code).toBe(2);expect(result.data.reply.status).toBe('refused');expect(f.connections()).toBe(1);expect(existsSync(sent.from.slice(4))).toBe(false);
+},{onMessage:(text,path)=>{
+  const sent=JSON.parse(text);postReply(sent.from,[{type:'control',from:'uds:'+path,action:'peer_message_status',status:'refused',orig_msg_id:sent.msg_id}]);
+}}));
+
+test('concurrent requests have distinct reply inboxes', () => fixture(async f=>{
+  const results=await Promise.all([f.send('FIRST','--wait','2'),f.send('SECOND','--wait','2')]);
+  expect(results.map(r=>r.data.reply.text)).toEqual(['FIRST','SECOND']);
+  const addresses=f.received.map(text=>JSON.parse(text).from);expect(new Set(addresses).size).toBe(2);
+  expect(addresses.every(address=>!existsSync(address.slice(4)))).toBe(true);
+},{onMessage:(text,path)=>{
+  const sent=JSON.parse(text),answer=sent.message.content.includes('FIRST')?'FIRST':'SECOND';
+  setTimeout(()=>postReply(sent.from,[{type:'user',from:'uds:'+path,message:{role:'user',content:answer}}]),answer==='FIRST'?80:10);
+}}));
+
+test('invalid wait arguments cannot send a message', () => fixture(async f=>{
+  for(const wait of ['0','-1','1.5','3601'])expect((await f.send('hello',`--wait=${wait}`)).data.error).toBe('invalid_argument');
+  expect((await f.run(['list','--wait','1'])).data.error).toBe('invalid_argument');expect(f.connections()).toBe(0);
+}));
+
+test('a reply from a changed session identity is not accepted', async ()=>{
+  let change;
+  await fixture(async f=>{
+    change=()=>f.registration({sessionId:randomUUID()});
+    const result=await f.send('Check identity','--wait','2');
+    expect(result.code).toBe(2);expect(result.data.reply.status).toBe('target_changed');expect(result.data.reply.text).toBeUndefined();expect(f.connections()).toBe(1);
+  },{onMessage:(text,path)=>{
+    const sent=JSON.parse(text);change();postReply(sent.from,[{type:'user',from:'uds:'+path,message:{role:'user',content:'An answer after target change'}}]);
+  }});
+});
+
+test('held receipts remain distinct from answers and do not trigger retries', () => fixture(async f=>{
+  const result=await f.send('Hold this request','--wait','1');
+  expect(result.code).toBe(2);expect(result.data.reply).toMatchObject({status:'timeout',receipt:{status:'held'}});expect(f.connections()).toBe(1);
+},{onMessage:(text,path)=>{
+  const sent=JSON.parse(text);postReply(sent.from,[{type:'control',from:'uds:'+path,action:'peer_message_status',status:'held',orig_msg_id:sent.msg_id}]);
+}}));
+
+test('interrupting --wait removes its socket and temporary directory', () => fixture(async f=>{
+  const child=Bun.spawn([process.execPath,cli,'--config-dir',f.root,'send','--id',f.id,'--pid',String(process.pid),'--text','hello','--wait','60'],{stdout:'pipe',stderr:'pipe'});
+  try{
+    for(let n=0;n<100&&!f.received.length&&child.exitCode===null;n++)await Bun.sleep(10);
+    expect(f.received).toHaveLength(1);
+    const address=JSON.parse(f.received[0]).from.slice(4),directory=address.slice(0,address.lastIndexOf('/'));
+    expect(existsSync(address)).toBe(true);child.kill('SIGTERM');expect(await child.exited).toBe(143);
+    expect(existsSync(address)).toBe(false);expect(existsSync(directory)).toBe(false);expect(f.connections()).toBe(1);
+  }finally{if(child.exitCode===null)child.kill();await child.exited}
+}));
+
+test('fragmented native reply frames are assembled before returning', () => fixture(async f=>{
+  const result=await f.send('Unicode reply','--wait','2');
+  expect(result.code).toBe(0);expect(result.data.reply.text).toBe('你好 🌱');
+},{onMessage:(text,path)=>{
+  const sent=JSON.parse(text),frame=Buffer.from(JSON.stringify({type:'user',from:'uds:'+path,message:{role:'user',content:'你好 🌱'}})+'\n');
+  const split=frame.indexOf(Buffer.from('🌱'))+1,peer=createConnection(sent.from.slice(4),()=>{
+    peer.write(frame.subarray(0,split));setTimeout(()=>peer.write(frame.subarray(split),()=>peer.end()),10);
+  });peer.on('error',()=>{});
+}}));
+
+for(const frame of [{status:'expired',status_detail:'refused'},{status:'denied'},{status:'dropped'}]){
+  test(`terminal native delivery status: ${JSON.stringify(frame)}`,()=>fixture(async f=>{
+    const result=await f.send('No retry','--wait','2');
+    expect(result.code).toBe(2);expect(result.data.reply.status).toBe(frame.status_detail||frame.status);expect(f.connections()).toBe(1);
+  },{onMessage:(text,path)=>{
+    const sent=JSON.parse(text);postReply(sent.from,[{type:'control',from:'uds:'+path,action:'peer_message_status',orig_msg_id:sent.msg_id,...frame}]);
+  }}));
+}

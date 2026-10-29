@@ -8,13 +8,14 @@ import { createInterface } from 'node:readline';
 import { createConnection } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
+import { replyInbox } from './reply.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 class Failure extends Error { constructor(code, message) { super(message); this.code = code; } }
 const fail = (code, message) => { throw new Failure(code, message); };
 const missing = e => e.code === 'ENOENT' || e.code === 'ESRCH';
 const normalize = s => String(s).trim().replace(/\s+/g, ' ');
-const options = {id:{type:'string'},pid:{type:'string'},text:{type:'string'},tail:{type:'string'},'max-chars':{type:'string'},before:{type:'string'},after:{type:'string'},events:{type:'boolean'},'config-dir':{type:'string'},help:{type:'boolean'}};
+const options = {id:{type:'string'},pid:{type:'string'},text:{type:'string'},wait:{type:'string'},tail:{type:'string'},'max-chars':{type:'string'},before:{type:'string'},after:{type:'string'},events:{type:'boolean'},'config-dir':{type:'string'},help:{type:'boolean'}};
 let args,positionals,command,root;
 const number = (name, fallback, max) => { const value=args[name]===undefined?fallback:Number(args[name]); if(!Number.isSafeInteger(value)||value<0||value>max)fail('invalid_argument',`--${name} must be an integer between 0 and ${max}`); return value; };
 function sessionId() { if(!UUID.test(args.id||''))fail('invalid_argument','--id requires a full session UUID'); return args.id; }
@@ -252,17 +253,26 @@ async function send() {
   const text=args.text==='-'?await Bun.stdin.text():args.text;if(!text.trim())fail('invalid_argument','Message must not be empty');
   const file=join(root,'sessions',`${pid}.json`),row=readRegistration(file);
   if(row.sessionId!==id)fail('target_mismatch','UUID and PID do not refer to the same registered session');
-  const socket=socketIdentity(row),msgId=randomUUID(),payload=JSON.stringify({type:'user',session_id:id,uuid:msgId,msg_id:msgId,from:'external-agent',message:{role:'user',content:text}})+'\n';
-  if(payload.length>1000000)fail('message_too_large','Serialized message exceeds 1,000,000 characters');
+  const wait=number('wait',0,3600);if(args.wait!==undefined&&!wait)fail('invalid_argument','--wait must be between 1 and 3600 seconds');
+  const socket=socketIdentity(row),msgId=randomUUID();
+  const validateTarget=()=>{
+    const current=readRegistration(file),now=socketIdentity(current);
+    if(current.sessionId!==id||current.procStart!==row.procStart||now.path!==socket.path||now.ino!==socket.ino||now.dev!==socket.dev)fail('target_changed','Session or socket identity changed');
+  };
   let cursor=null;try{cursor=(await conversation(id,true)).messages.at(-1)?.id||null}catch(e){if(e.code!=='transcript_missing')throw e}
+  const inbox=wait?await replyInbox(socket.path,msgId,validateTarget):null;
+  try{
+  // Native origin.from is not shown to the model. An explicit wrapper makes its return address actionable.
+  const body=inbox?`<cross-session-message from="${inbox.address}">\n${text}\n\nReply using SendMessage to the from address above.\n</cross-session-message>`:text;
+  const payload=JSON.stringify({type:'user',session_id:id,uuid:msgId,msg_id:msgId,...inbox&&{msgV:1},from:inbox?.address||'external-agent',message:{role:'user',content:body}})+'\n';
+  if(payload.length>1000000)fail('message_too_large','Serialized message exceeds 1,000,000 characters');
   let deadline;
   await new Promise((resolve,reject)=>{
     let submitted=false,attempted=false;
     const client=createConnection({path:socket.path},()=>{
       try {
         // Discovery is a snapshot. Revalidate after connect, before any bytes leave.
-        const current=readRegistration(file),now=socketIdentity(current);
-        if(current.sessionId!==id||current.procStart!==row.procStart||now.path!==socket.path||now.ino!==socket.ino||now.dev!==socket.dev)fail('target_changed','Session or socket changed; nothing sent');
+        validateTarget();
         attempted=true;
         // Bun can finish end(data) after a short write. Flush explicitly and check its byte count before closing.
         client.write(payload,error=>{if(error||client.bytesWritten<Buffer.byteLength(payload)){client.destroy(error||new Failure('outcome_unknown','Write interrupted; inspect the recipient before retrying'));return;}submitted=true;client.end();});
@@ -273,12 +283,16 @@ async function send() {
     client.on('error',e=>reject(attempted?new Failure('outcome_unknown','Connection failed after a write attempt; inspect the recipient before retrying'):e));
     client.on('data',()=>{});client.on('close',error=>{if(!error){if(submitted)resolve();else reject(new Failure(attempted?'outcome_unknown':'not_submitted','Connection closed before write completed; inspect the recipient before retrying'));}});
   }).finally(()=>clearTimeout(deadline));
-  return {status:'submitted',acceptance:'unconfirmed',sessionId:id,pid,messageId:msgId,cursor,sentAt:new Date().toISOString(),note:'Read the recipient transcript to verify receipt or completion. Do not infer either from this write.'};
+  const result={status:'submitted',acceptance:'unconfirmed',sessionId:id,pid,messageId:msgId,cursor,sentAt:new Date().toISOString(),note:'Read the recipient transcript to verify receipt or completion. Do not infer either from this write.'};
+  if(inbox){result.reply=await inbox.wait(wait);result.note='The request-specific inbox is now closed. A reply is not proof of task completion; a timeout does not justify resending.';if(result.reply.status!=='received')process.exitCode=2;}
+  return result;
+  }finally{await inbox?.close()}
 }
 async function main() {
-  if(args.help||!command)return {usage:'bun scripts/sessions.mjs list | read --id UUID [--tail N --max-chars N --before UUID --after UUID --events] | send --id UUID --pid PID --text TEXT',configDir:root};
+  if(args.help||!command)return {usage:'bun scripts/sessions.mjs list | read --id UUID [--tail N --max-chars N --before UUID --after UUID --events] | send --id UUID --pid PID --text TEXT [--wait SECONDS]',configDir:root};
   if(positionals.length!==1)fail('invalid_argument','Unexpected positional arguments; pass message text with --text');
   if(!['darwin','linux'].includes(process.platform))fail('unsupported_platform','Only macOS and Linux Unix sockets are supported');
+  if(args.wait!==undefined&&command!=='send')fail('invalid_argument','--wait is only supported by send');
   if(command==='read')return {sessionId:sessionId(),...page(await conversation(args.id,args.events))};
   if(command==='send')return send();
   if(command!=='list')fail('invalid_argument',`Unknown command: ${command}`);
