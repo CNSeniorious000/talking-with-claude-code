@@ -40,6 +40,39 @@ test('direct API composes multiple sends and receives and resumes after timeout'
 }),10000);
 
 const cli = join(import.meta.dir, 'sessions.mjs');
+test('bound channels pin routing, advance their cursor and reject overlapping waits',()=>fixture(async f=>{
+  const api=createSessions({configDir:f.root}),channel=await api.connect({id:f.id,pid:process.pid,name:'bound'});
+  try{
+    expect(channel.handle.endsWith('/request.json')).toBe(true);expect(channel.address.startsWith('uds:')).toBe(true);
+    await expect(channel.send({text:'wrong',senderMode:'bypass'})).rejects.toMatchObject({code:'invalid_argument'});
+    await expect(channel.send({text:'wrong',channel:'elsewhere'})).rejects.toMatchObject({code:'invalid_argument'});
+    await expect(channel.wait({after:'0'})).rejects.toMatchObject({code:'invalid_argument'});expect(f.connections()).toBe(0);
+    const sent=await channel.send({text:'first'}),before=channel.cursor,pending=channel.wait({timeout:2});
+    await expect(channel.wait({timeout:1})).rejects.toMatchObject({code:'wait_in_progress'});
+    postReply(channel.address,[{type:'control',from:'uds:'+f.socketPath,action:'peer_message_status',orig_msg_id:sent.messageId,status:'held'},channelFrame(f,'first answer'),channelFrame(f,'second answer')]);
+    const first=await pending;expect(first.reply.text).toBe('first answer');expect(first.receipts[0].receipt.status).toBe('held');expect(channel.cursor).not.toBe(before);
+    first.cursor='mutated';expect(channel.cursor).not.toBe('mutated');
+    expect((await channel.wait({until:'event',timeout:1})).reply.text).toBe('second answer');
+    expect((await channel.status({messageId:sent.messageId})).status).toBe('submitted');
+    expect(JSON.parse(JSON.stringify(channel))).toMatchObject({handle:channel.handle,address:channel.address,cursor:channel.cursor,closed:false});
+  }finally{await channel.close()}
+  expect(channel.closed).toBe(true);expect((await channel.close()).status).toBe('closed');
+  await expect(channel.send({text:'after close'})).rejects.toMatchObject({code:'channel_closed'});
+}),10000);
+
+test('bound channel snapshots resume after timeout and close wakes a pending wait',()=>fixture(async f=>{
+  const api=createSessions({configDir:f.root}),channel=await api.connect({id:f.id,pid:process.pid,name:'resume'});
+  try{
+    const before=channel.cursor;expect((await channel.wait({timeout:1})).reply.status).toBe('timeout');expect(channel.cursor).toBe(before);
+    const saved=JSON.parse(JSON.stringify(channel));saved.address='uds:untrusted-snapshot';
+    const resumed=api.resumeChannel(saved);expect(resumed.address).toBe(channel.address);
+    postReply(channel.address,[channelFrame(f,'cached while not waiting')]);
+    expect((await resumed.wait({timeout:2})).reply.text).toBe('cached while not waiting');
+    const pending=resumed.wait({timeout:2}),closing=resumed.close();expect(resumed.closed).toBe(false);
+    const [ended]=await Promise.all([pending,closing]);expect(['closed','cancelled']).toContain(ended.reply.status);expect(resumed.snapshot().closed).toBe(true);
+    expect(f.connections()).toBe(0);
+  }finally{if(existsSync(channel.handle))await channel.close()}
+}),10000);
 const procStat = process.platform === 'linux' ? readFileSync(`/proc/${process.pid}/stat`, 'utf8') : null;
 const procStart = procStat === null ? execFileSync('/bin/ps', ['-p', String(process.pid), '-o', 'lstart='], { encoding: 'utf8', env: { ...process.env, TZ: 'UTC', LC_ALL: 'C' } }).trim() : procStat.slice(procStat.lastIndexOf(')') + 2).split(/\s+/)[19];
 const turn = (type, text, parentUuid = null, extra = {}) => ({ type, uuid: randomUUID(), parentUuid, timestamp: new Date().toISOString(), message: { role: type, content: text }, ...extra });

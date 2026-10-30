@@ -14,3 +14,4 @@ jobs:
         with:
           bun-version: 1.4.4
       - run: bun test
+      - run: bunx --package typescript@5.9.3 tsc --noEmit --strict --module NodeNext --target ES2022 scripts/sessions.typecheck.mts

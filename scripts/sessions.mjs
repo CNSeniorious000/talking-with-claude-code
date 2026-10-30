@@ -10,6 +10,7 @@ import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { startReply, receiveReply, waitReply, closeReply, loadChannel, waitChannel, sendChannel, outgoingStatus, listChannels } from './reply-store.mjs';
 import { writeFrame } from './transport.mjs';
+import { channelCursor } from './channel-events.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 class Failure extends Error { constructor(code, message) { super(message); this.code = code; } }
@@ -412,7 +413,47 @@ export function createSessions({configDir}={}){
     }
     return structuredClone((await execute(command,args)).result);
   };
-  return Object.freeze(Object.fromEntries(['list','read','open','send','wait','status','channels','close'].map(command=>[command,input=>call(command,input)])));
+  const checked=(input,allowed)=>{
+    if(!input||typeof input!=='object'||Array.isArray(input))fail('invalid_argument','Expected an options object');
+    for(const key of Object.keys(input))if(!allowed.includes(key))fail('invalid_argument',`Unexpected channel option: ${key}`);
+    return input;
+  };
+  const bind=metadata=>{
+    const {channel:handle,address,name,sessionId,pid,expiresAt}=metadata;
+    let cursor=metadata.cursor,waiting=false,closed=false,closing;
+    const active=()=>{if(closed||closing)fail('channel_closed','This channel is closing or closed')};
+    const snapshot=()=>({handle,address,name,sessionId,pid,expiresAt,cursor,closed});
+    return Object.freeze({
+      handle,address,name,sessionId,pid,expiresAt,get cursor(){return cursor},get closed(){return closed},
+      snapshot,toJSON:snapshot,
+      async send(input){active();checked(input,['text','messageId']);return call('send',{...input,channel:handle})},
+      async status(input){active();checked(input,['messageId']);return call('status',{...input,channel:handle})},
+      async wait(input={}){
+        active();checked(input,['timeout','until']);
+        const until=input.until??'reply';if(!['reply','event'].includes(until))fail('invalid_argument','until must be reply or event');
+        // One cursor owner prevents simultaneous reads from accidentally replaying the same buffered event.
+        if(waiting)fail('wait_in_progress','A wait is already pending on this channel');
+        waiting=true;
+        try{const result=await call('wait',{channel:handle,after:cursor,timeout:input.timeout,...until==='reply'&&{until}});cursor=result.cursor;return result}
+        finally{waiting=false}
+      },
+      async close(){
+        if(closed)return {status:'closed',channel:handle};
+        if(!closing)closing=call('close',{channel:handle}).then(result=>{closed=true;return result}).finally(()=>{closing=undefined});
+        return structuredClone(await closing);
+      },
+    });
+  };
+  return Object.freeze({
+    ...Object.fromEntries(['list','read','open','send','wait','status','channels','close'].map(command=>[command,input=>call(command,input)])),
+    async connect(input){checked(input,['id','pid','name','ttl','senderMode']);return bind(await call('open',input))},
+    resumeChannel(input){
+      checked(input,['handle','cursor','address','name','sessionId','pid','expiresAt','closed']);
+      if(typeof input.handle!=='string'||typeof input.cursor!=='string')fail('invalid_argument','Resume requires a saved handle and cursor');
+      const {data,ready,request}=loadChannel(input.handle);channelCursor(data,input.cursor);
+      return bind({channel:request,address:ready.address,name:data.channel.name,sessionId:data.row.sessionId,pid:data.row.pid,expiresAt:data.expiresAt,cursor:input.cursor});
+    },
+  });
 }
 
 if(import.meta.main)try {
