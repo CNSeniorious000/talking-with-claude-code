@@ -39,12 +39,12 @@ function observe(directory,read,seconds){
     }catch(e){done(undefined,e)}
   });
 }
-export async function startReply(entrypoint,row,socket,messageId,ttl,channel,configDir){
+export async function startReply(entrypoint,row,socket,messageId,ttl,channel){
   const directory=realpathSync(mkdtempSync(join(tmpdir(),'ccs-request-')));chmodSync(directory,0o700);
   const request=join(directory,'request.json'),expiresAt=new Date(Date.now()+ttl*1000).toISOString();
   publish(directory,'request.json',{kind:'claude-code-reply',version:1,directory,expiresAt,row,socket,messageId,...channel&&{channel}});
   if(channel?.id)mkdirSync(join(directory,'outgoing'),{mode:0o700});
-  const child=spawn(process.execPath,[entrypoint,'_receive','--request',request],{detached:true,stdio:'ignore',env:{...process.env,...configDir&&{CLAUDE_CONFIG_DIR:configDir}}});let startupError;
+  const child=spawn(process.execPath,[entrypoint,'_receive','--request',request],{detached:true,stdio:'ignore'});let startupError;
   child.on('error',e=>startupError=e);
   try{
     const ready=await observe(directory,()=>{
@@ -198,7 +198,8 @@ export async function waitChannel(channel,after,seconds,validateTarget){
     }catch(e){if(e.code==='ENOENT'&&!existsSync(join(directory,'request.json')))return {status:'closed'};throw e}
   };
   const reply=await observe(directory,read,Math.min(seconds,Math.max(0,(Date.parse(data.expiresAt)-Date.now())/1000)));
-  return {channel,address:ready.address,name:data.channel.name,sessionId:data.row.sessionId,expiresAt:data.expiresAt,cursor:cursorFor(data,reply?.seq||seq),reply:reply||{status:'timeout'}};
+  // Events are cached per channel; clone the escaping event so a caller cannot mutate later waits.
+  return {channel,address:ready.address,name:data.channel.name,sessionId:data.row.sessionId,expiresAt:data.expiresAt,cursor:cursorFor(data,reply?.seq||seq),reply:reply?structuredClone(reply):{status:'timeout'}};
 }
 export async function closeReply(request){
   const {directory}=load(request);

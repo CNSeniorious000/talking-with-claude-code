@@ -17,10 +17,11 @@ class Failure extends Error { constructor(code, message) { super(message); this.
 const fail = (code, message) => { throw new Failure(code, message); };
 const missing = e => e.code === 'ENOENT' || e.code === 'ESRCH';
 const normalize = s => String(s).trim().replace(/\s+/g, ' ');
+const configRoot = dir => resolve(dir||process.env.CLAUDE_CONFIG_DIR||join(homedir(),'.claude'));
 const options = {id:{type:'string'},pid:{type:'string'},text:{type:'string'},wait:{type:'string'},request:{type:'string'},channel:{type:'string'},name:{type:'string'},ttl:{type:'string'},timeout:{type:'string'},until:{type:'string'},'message-id':{type:'string'},'reply-ttl':{type:'string'},'sender-mode':{type:'string'},tail:{type:'string'},'max-chars':{type:'string'},before:{type:'string'},after:{type:'string'},events:{type:'boolean'},'no-preview':{type:'boolean'},'config-dir':{type:'string'},help:{type:'boolean'}};
 // Each invocation owns its arguments: concurrent calls in a persistent Bun host must not share CLI state.
-async function execute(command,args,cli=false,positionals=[command]){
-let exitCode=0;const root=resolve(args['config-dir']||process.env.CLAUDE_CONFIG_DIR||join(homedir(),'.claude'));
+async function execute(command,args,positionals=[]){
+let exitCode=0;const root=configRoot(args['config-dir']);
 const number = (name, fallback, max) => { const value=args[name]===undefined?fallback:Number(args[name]); if(!Number.isSafeInteger(value)||value<0||value>max)fail('invalid_argument',`--${name} must be an integer between 0 and ${max}`); return value; };
 function sessionId() { if(!UUID.test(args.id||''))fail('invalid_argument','--id requires a full session UUID'); return args.id; }
 function readRegistration(file) {
@@ -276,19 +277,19 @@ async function openChannel(){
   const name=args.name;
   if(!name||name!==name.trim()||[...name].length>64||/["<>\p{C}\p{Zl}\p{Zp}]/u.test(name))fail('invalid_argument','--name requires 1–64 visible characters without quotes or angle brackets');
   const senderMode=permissionMode(),ttl=number('ttl',3600,86400);if(!ttl)fail('invalid_argument','--ttl must be between 1 and 86400 seconds');
-  const channelId=randomUUID(),{row,socket}=target(),inbox=await startReply(fileURLToPath(import.meta.url),row,socket,null,ttl,{id:channelId,name,senderMode},root);
+  const channelId=randomUUID(),{row,socket}=target(),inbox=await startReply(fileURLToPath(import.meta.url),row,socket,null,ttl,{id:channelId,name,senderMode});
   return {status:'open',channel:inbox.request,channelId,cursor:channelId+':0',address:inbox.address,name,sessionId:row.sessionId,pid:row.pid,expiresAt:inbox.expiresAt};
 }
 async function send() {
   const channel=args.channel?loadChannel(args.channel,{active:true}):null;
   const {row,socket}=channel?channel.data:target(),id=row.sessionId,pid=row.pid,senderMode=channel?channel.data.channel.senderMode:permissionMode(),name=channel?.data.channel.name;
   if(args.text===undefined)fail('invalid_argument','--text is required; use --text - to read stdin');
-  const text=cli&&args.text==='-'?await Bun.stdin.text():args.text;if(!text.trim())fail('invalid_argument','Message must not be empty');
+  const text=import.meta.main&&args.text==='-'?await Bun.stdin.text():args.text;if(!text.trim())fail('invalid_argument','Message must not be empty');
   const wait=number('wait',0,3600),ttl=number('reply-ttl',3600,86400);if(!ttl)fail('invalid_argument','--reply-ttl must be between 1 and 86400 seconds');
   if(args['message-id']&&!channel?.data.channel.id)fail('invalid_argument','Idempotent sends require a newly opened channel');
   validateTarget(row,socket);const msgId=args['message-id']?.toLowerCase()||randomUUID();
   let cursor=null;if(!channel)try{cursor=(await conversation(id,true)).messages.at(-1)?.id||null}catch(e){if(e.code!=='transcript_missing')throw e}
-  const inbox=channel?{request:channel.request,expiresAt:channel.data.expiresAt,address:channel.ready.address}:args.wait!==undefined?await startReply(fileURLToPath(import.meta.url),row,socket,msgId,ttl,undefined,root):null;
+  const inbox=channel?{request:channel.request,expiresAt:channel.data.expiresAt,address:channel.ready.address}:args.wait!==undefined?await startReply(fileURLToPath(import.meta.url),row,socket,msgId,ttl):null;
   let sent=false;
   try{
   // Native origin.from is not shown to the model. An explicit wrapper makes its return address actionable.
@@ -326,7 +327,7 @@ async function main() {
     'follow --channel PATH [--after CURSOR]',
     'close (--channel PATH | --request PATH)'
   ],configDir:root};
-  if(positionals.length!==1)fail('invalid_argument','Unexpected positional arguments; pass message text with --text');
+  if(import.meta.main&&positionals.length!==1)fail('invalid_argument','Unexpected positional arguments; pass message text with --text');
   if(args['no-preview']!==undefined&&command!=='list')fail('invalid_argument','--no-preview is only supported by list');
   if(!['darwin','linux'].includes(process.platform))fail('unsupported_platform','Only macOS and Linux Unix sockets are supported');
   if(args.wait!==undefined&&command!=='send')fail('invalid_argument','--wait is only supported by send');
@@ -400,31 +401,30 @@ const result=await main();return {result,exitCode};
 
 /** Direct Bun API. Lifecycle outcomes are data; invalid arguments and transport failures throw errors with .code. */
 export function createSessions({configDir}={}){
-  const root=resolve(configDir||process.env.CLAUDE_CONFIG_DIR||join(homedir(),'.claude'));
-  const aliases={senderMode:'sender-mode',messageId:'message-id',replyTtl:'reply-ttl',maxChars:'max-chars',noPreview:'no-preview'};
+  const root=configRoot(configDir);
   const call=async(command,input={})=>{
     const args={'config-dir':root};
     for(const [key,value] of Object.entries(input)){
-      const flag=aliases[key]||key;
+      const flag=key.replace(/[A-Z]/g,c=>'-'+c.toLowerCase());
       if(!Object.hasOwn(options,flag)||['config-dir','help'].includes(flag))fail('invalid_argument',`Unknown API option: ${key}`);
       if(value===undefined)continue;
       if(options[flag].type==='boolean'?typeof value!=='boolean':typeof value!=='string'&&typeof value!=='number')fail('invalid_argument',`Invalid API option: ${key}`);
       args[flag]=options[flag].type==='boolean'?value:String(value);
     }
-    return structuredClone((await execute(command,args)).result);
+    return (await execute(command,args)).result;
   };
   const checked=(input,allowed)=>{
     if(!input||typeof input!=='object'||Array.isArray(input))fail('invalid_argument','Expected an options object');
-    for(const key of Object.keys(input))if(!allowed.includes(key))fail('invalid_argument',`Unexpected channel option: ${key}`);
+    for(const key of Object.keys(input))if(!allowed.includes(key))fail('invalid_argument',`Unexpected option: ${key}`);
     return input;
   };
   const bind=metadata=>{
     const {channel:handle,address,name,sessionId,pid,expiresAt}=metadata;
     let cursor=metadata.cursor,waiting=false,closed=false,closing;
     const active=()=>{if(closed||closing)fail('channel_closed','This channel is closing or closed')};
-    const snapshot=()=>({handle,address,name,sessionId,pid,expiresAt,cursor,closed});
+    const fixed={handle,address,name,sessionId,pid,expiresAt},snapshot=()=>({...fixed,cursor,closed});
     return Object.freeze({
-      handle,address,name,sessionId,pid,expiresAt,get cursor(){return cursor},get closed(){return closed},
+      ...fixed,get cursor(){return cursor},get closed(){return closed},
       snapshot,toJSON:snapshot,
       async send(input){active();checked(input,['text','messageId']);return call('send',{...input,channel:handle})},
       async status(input){active();checked(input,['messageId']);return call('status',{...input,channel:handle})},
@@ -458,5 +458,5 @@ export function createSessions({configDir}={}){
 
 if(import.meta.main)try {
   const {values:args,positionals}=parseArgs({args:process.argv.slice(2),options,allowPositionals:true});
-  const {result,exitCode}=await execute(positionals[0],args,true,positionals);process.exitCode=exitCode;if(result!==undefined)console.log(JSON.stringify(result,null,2));
+  const {result,exitCode}=await execute(positionals[0],args,positionals);process.exitCode=exitCode;if(result!==undefined)console.log(JSON.stringify(result,null,2));
 } catch(e) { console.error(JSON.stringify({error:e.code||'failed',message:e.message,...e.request&&{request:e.request,expiresAt:e.expiresAt},...e.channel&&{channel:e.channel},...e.messageId&&{messageId:e.messageId}}));process.exitCode=1; }
