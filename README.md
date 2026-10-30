@@ -24,7 +24,7 @@ Ask your agent, for example:
 - “Ask the Claude session reviewing this project what it found.”
 - “Keep a conversation open with that session and wait for its updates.”
 
-Your agent follows [SKILL.md](SKILL.md) to identify the recipient and manage the conversation. Channels stay open for one hour by default, and a wait timeout does not close them.
+Your agent follows [SKILL.md](skills/talking-with-claude-code/SKILL.md) to identify the recipient and manage the conversation. Channels stay open for one hour by default, and a wait timeout does not close them.
 
 Agents with a persistent Bun MCP or CodeAct runtime can import the communication library directly, keep conversation state between tool calls, and compose multi-round exchanges in code.
 

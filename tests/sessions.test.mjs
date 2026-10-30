@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { createConnection, createServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { createSessions } from './sessions.mjs';
+import { createSessions } from '../skills/talking-with-claude-code/scripts/sessions.mjs';
 
 test('direct clients keep concurrent registries isolated without changing host exit status',()=>fixture(async a=>fixture(async b=>{
   const first=createSessions({configDir:a.root}),second=createSessions({configDir:b.root}),exitCode=process.exitCode;
@@ -39,7 +39,7 @@ test('direct API composes multiple sends and receives and resumes after timeout'
   }finally{await api.close({channel})}
 }),10000);
 
-const cli = join(import.meta.dir, 'sessions.mjs');
+const cli = join(import.meta.dir, '../skills/talking-with-claude-code/scripts/sessions.mjs');
 test('bound channels pin routing, advance their cursor and reject overlapping waits',()=>fixture(async f=>{
   const api=createSessions({configDir:f.root}),channel=await api.connect({id:f.id,pid:process.pid,name:'bound'});
   try{
@@ -164,7 +164,7 @@ test('message status distinguishes unknown messages from closed channels and rej
     const args=[command,'--channel',channel,'--message-id','../../escape'];if(command==='send')args.push('--text','reject');
     expect((await f.run(args)).data.error).toBe('invalid_argument');
   }
-  const {sendChannel,outgoingStatus}=await import('./reply-store.mjs');
+  const {sendChannel,outgoingStatus}=await import('../skills/talking-with-claude-code/scripts/reply-store.mjs');
   expect(()=>outgoingStatus(channel,'../../escape')).toThrow('lowercase UUID');
   await expect(sendChannel(channel,'reject','../../escape')).rejects.toThrow('lowercase UUID');
   expect((await f.run(['close','--channel',channel])).code).toBe(0);

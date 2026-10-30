@@ -1,4 +1,4 @@
-import { createSessions, type SenderMode, type ReplyAddress, type ReceiptEvent, type LegacyReplyEvent, type RequestWaitResult, type OutgoingStatus } from './sessions.mjs';
+import { createSessions, type SenderMode, type ReplyAddress, type ReceiptEvent, type LegacyReplyEvent, type RequestWaitResult, type OutgoingStatus } from '../skills/talking-with-claude-code/scripts/sessions.mjs';
 // Valid wire shapes include null IDs, timestamps nested in receipts, and outgoing failures without a status.
 ({kind:'receipt',status:'receipt',seq:1,receipt:{messageId:null,status:'held',correlated:false,receivedAt:'timestamp'}} satisfies ReceiptEvent);
 ({status:'received',seq:1,text:'legacy',from:'uds:peer',messageId:null,receivedAt:'timestamp'} satisfies LegacyReplyEvent);

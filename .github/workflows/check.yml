@@ -14,4 +14,4 @@ jobs:
         with:
           bun-version: latest
       - run: bun test
-      - run: bunx --package typescript tsc --noEmit --strict --module NodeNext --target ES2022 scripts/sessions.typecheck.mts
+      - run: bunx --package typescript tsc --noEmit --strict --module NodeNext --target ES2022 tests/sessions.typecheck.mts
