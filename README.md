@@ -1,10 +1,10 @@
 # talking-with-claude-code
 
-Let Codex, OpenCode, or another coding agent find and talk to your local Claude Code sessions.
+A local messaging bridge that lets Codex, OpenCode, or another coding agent find and talk to your Claude Code sessions.
 
 Claude Code already keeps a local registry of its sessions, including their messaging addresses. This skill uses that registry to discover sessions, read their conversation context, and contact the right one. Claude does not have to send the first message, and you do not need to copy a session's address by hand.
 
-Your agent can ask Claude a question, request a review, or keep an ongoing conversation open. A channel gives it a return address that Claude receives with the first message. Both sides can then send multiple messages independently while that channel remains open; Claude replies through its native `SendMessage` tool.
+Your agent can ask Claude a question, request a review, or keep an ongoing conversation open. A channel gives it a return address that Claude receives with the first message. Messaging is full-duplex: both sides can send multiple messages independently, without waiting for their turn, while that channel remains open. Claude sends through its native `SendMessage` tool.
 
 Claude can send back only after your agent has shared its return address. This skill does not add the external agent to Claude's session list. Incoming messages are saved until your agent reads them; they do not automatically wake an agent that has stopped running.
 

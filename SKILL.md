@@ -1,20 +1,20 @@
 ---
-name: claude-code-sessions
-description: Read or message local Claude Code terminal sessions via Bun. Use for inspection or communication with Claude Code sessions, and questions about sender-mode, held/expired receipts or reply waits, including explanation-only requests. Consulting these instructions does not inspect sessions. General navigation, unrelated concepts and drafting alone do not need this skill.
+name: talking-with-claude-code
+description: Inspect local Claude Code terminal sessions and use full-duplex messaging via Bun. Use for inspection or communication with Claude Code sessions, and questions about sender-mode, held/expired receipts or reply waits, including explanation-only requests. Consulting these instructions does not inspect sessions. General navigation, unrelated concepts and drafting alone do not need this skill.
 license: MIT
 compatibility: Bun, macOS or Linux, and local Claude Code session files. Sending requires Claude Code's native inbox socket.
 metadata:
   author: CNSeniorious000
 ---
 
-# Claude Code sessions
+# Talking with Claude Code
 
 Resolve `scripts/sessions.mjs` relative to this skill. Run it with Bun. Commands emit JSON; `follow` emits NDJSON. Select Claude data with `--config-dir <path>` or `CLAUDE_CONFIG_DIR` (default `~/.claude`).
 
 Identify the requested product and action before inspecting sessions. A navigation question, conceptual explanation or draft does not request local inspection. Having access to a registry does not make reading it part of the task.
 For communication troubleshooting, consult these instructions without inspecting or contacting sessions unless the user requests it.
 
-Claude Code maintains its own local session registry and native inbox sockets. Discover recipients with `list`; no prior message from Claude is needed. To receive ongoing messages, use `open` then `send --channel`: the first send gives Claude your return address. Your receiver is not registered in Claude's `ListAgents`; Claude cannot discover it by display name. Once informed, Claude can send independently until the channel closes or expires.
+Claude Code maintains its own local session registry and native inbox sockets. Discover recipients with `list`; no prior message from Claude is needed. To establish full-duplex messaging, use `open` then `send --channel`: the first send gives Claude your return address. Your receiver is not registered in Claude's `ListAgents`; Claude cannot discover it by display name. Once informed, both sides can send independently until the channel closes or expires; sending does not require an outstanding wait.
 
 ## Discover and read
 
