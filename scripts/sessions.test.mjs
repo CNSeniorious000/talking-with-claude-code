@@ -4,6 +4,40 @@ import { execFileSync } from 'node:child_process';
 import { createConnection, createServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import { createSessions } from './sessions.mjs';
+
+test('direct clients keep concurrent registries isolated without changing host exit status',()=>fixture(async a=>fixture(async b=>{
+  const first=createSessions({configDir:a.root}),second=createSessions({configDir:b.root}),exitCode=process.exitCode;
+  const [x,y]=await Promise.all([first.list({noPreview:true}),second.list({noPreview:true})]);
+  expect(x.sessions[0].id).toBe(a.id);expect(y.sessions[0].id).toBe(b.id);
+  a.conversation([turn('assistant','first registry')]);b.conversation([turn('assistant','second registry')]);
+  const [left,right]=await Promise.all([first.read({id:a.id}),second.read({id:b.id})]);
+  expect(left.messages[0].text).toBe('first registry');expect(right.messages[0].text).toBe('second registry');
+  await expect(first.open({id:b.id,pid:process.pid,name:'wrong target'})).rejects.toMatchObject({code:'target_mismatch'});
+  await first.send({id:a.id,pid:process.pid,text:'-'});
+  await Bun.sleep(20);expect(JSON.parse(a.received[0]).message.content).toBe('-');expect(b.connections()).toBe(0);expect(process.exitCode).toBe(exitCode);
+})));
+
+test('direct API composes multiple sends and receives and resumes after timeout',()=>fixture(async f=>{
+  const api=createSessions({configDir:f.root}),exitCode=process.exitCode,opened=await api.open({id:f.id,pid:process.pid,name:'Bun composition',ttl:60});
+  const channel=opened.channel;let cursor=opened.cursor;
+  try{
+    const pending=await api.wait({channel,after:cursor,until:'reply',timeout:1});expect(pending.reply.status).toBe('timeout');expect(process.exitCode).toBe(exitCode);
+    for(const text of ['first','second']){
+      const messageId=randomUUID(),sent=await api.send({channel,messageId,text});
+      postReply(opened.address,[channelFrame(f,text+' reply')]);
+      const previous=cursor,answer=await api.wait({channel,after:cursor,until:'reply',timeout:2});cursor=answer.cursor;
+      expect(answer.reply.text).toBe(text+' reply');
+      answer.reply.text='caller mutation';expect((await api.wait({channel,after:previous,until:'reply',timeout:1})).reply.text).toBe(text+' reply');
+      expect((await api.send({channel,messageId,text})).reused).toBe(true);
+      expect((await api.status({channel,messageId})).sentAt).toBe(sent.sentAt);
+    }
+    const sent=await api.send({channel,text:'expire'});
+    postReply(opened.address,[{type:'control',from:'uds:'+f.socketPath,action:'peer_message_status',orig_msg_id:sent.messageId,status:'expired'}]);
+    expect((await api.wait({channel,after:cursor,until:'reply',timeout:2})).reply.receipt.status).toBe('expired');
+    expect(process.exitCode).toBe(exitCode);expect(f.connections()).toBe(3);
+  }finally{await api.close({channel})}
+}),10000);
 
 const cli = join(import.meta.dir, 'sessions.mjs');
 const procStat = process.platform === 'linux' ? readFileSync(`/proc/${process.pid}/stat`, 'utf8') : null;
@@ -821,7 +855,9 @@ test('a paused channel worker returns queued with an ID and later submits the sa
     expect((await f.run(['status','--channel',channel,'--message-id',id])).data.status).toBe('queued');
     process.kill(pid,'SIGCONT');resumed=true;
     expect((await f.run(['wait','--channel',channel,'--timeout','2'])).data.reply.text).toBe('resumed');
-    expect((await f.run(['status','--channel',channel,'--message-id',id])).data.status).toBe('submitted');
+    // Peer replies can arrive before the worker's write callback publishes its outgoing result.
+    let status;for(let attempt=0;attempt<20;attempt++){status=(await f.run(['status','--channel',channel,'--message-id',id])).data.status;if(status!=='queued')break;await Bun.sleep(25)}
+    expect(status).toBe('submitted');
     expect(f.connections()).toBe(1);
   }finally{if(!resumed)process.kill(pid,'SIGCONT');if(child?.exitCode===null)child.kill();if(child)await child.exited}
 },{onMessage:(text,path)=>{const sent=JSON.parse(text);postReply(sent.from,[{type:'user',from:'uds:'+path,message:{role:'user',content:'resumed'}}])}}),20000);

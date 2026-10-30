@@ -5,7 +5,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import { replyInbox } from './reply.mjs';
 import { writeFrame } from './transport.mjs';
-import { eventWriter, channelEvents, channelCursor, cursorFor } from './channel-events.mjs';
+import { eventWriter, channelEvents, channelCursor, cursorFor, forgetChannelEvents } from './channel-events.mjs';
 
 const failure=(code,message)=>Object.assign(new Error(message),{code});
 const validMessageId=id=>{if(typeof id!=='string'||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id))throw failure('invalid_argument','Message ID must be a lowercase UUID')};
@@ -39,12 +39,12 @@ function observe(directory,read,seconds){
     }catch(e){done(undefined,e)}
   });
 }
-export async function startReply(entrypoint,row,socket,messageId,ttl,channel){
+export async function startReply(entrypoint,row,socket,messageId,ttl,channel,configDir){
   const directory=realpathSync(mkdtempSync(join(tmpdir(),'ccs-request-')));chmodSync(directory,0o700);
   const request=join(directory,'request.json'),expiresAt=new Date(Date.now()+ttl*1000).toISOString();
   publish(directory,'request.json',{kind:'claude-code-reply',version:1,directory,expiresAt,row,socket,messageId,...channel&&{channel}});
   if(channel?.id)mkdirSync(join(directory,'outgoing'),{mode:0o700});
-  const child=spawn(process.execPath,[entrypoint,'_receive','--request',request],{detached:true,stdio:'ignore'});let startupError;
+  const child=spawn(process.execPath,[entrypoint,'_receive','--request',request],{detached:true,stdio:'ignore',env:{...process.env,...configDir&&{CLAUDE_CONFIG_DIR:configDir}}});let startupError;
   child.on('error',e=>startupError=e);
   try{
     const ready=await observe(directory,()=>{
@@ -224,5 +224,5 @@ export async function closeReply(request){
       unlinkSync(file);
     }
   }
-  rmdirSync(directory);return {status:'closed',request,...ended.undelivered?.length&&{undelivered:ended.undelivered}};
+  rmdirSync(directory);forgetChannelEvents(directory);return {status:'closed',request,...ended.undelivered?.length&&{undelivered:ended.undelivered}};
 }

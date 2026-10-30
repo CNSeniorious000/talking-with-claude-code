@@ -26,6 +26,8 @@ Ask your agent, for example:
 
 Your agent follows [SKILL.md](SKILL.md) to identify the recipient and manage the conversation. Channels stay open for one hour by default, and a wait timeout does not close them.
 
+Agents with a persistent Bun MCP or CodeAct runtime can import the communication library directly, keep conversation state between tool calls, and compose multi-round exchanges in code.
+
 ## Compatibility
 
 The receiving session can hold or refuse messages according to its permission settings. Successful submission does not prove that Claude has read the message or completed the requested work.

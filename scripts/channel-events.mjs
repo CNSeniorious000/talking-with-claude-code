@@ -4,6 +4,7 @@ import { StringDecoder } from 'node:string_decoder';
 
 const failure=(code,message)=>Object.assign(new Error(message),{code});
 const readers=new Map(),maxBytes=16*1024*1024,maxEvents=256;
+export const forgetChannelEvents=directory=>readers.delete(join(directory,'events.ndjson'));
 export function eventWriter(directory){
   const file=join(directory,'events.ndjson');writeFileSync(file,'',{flag:'wx',mode:0o600});
   let seq=0,bytes=0;

@@ -31,6 +31,8 @@ bun <skill-dir>/scripts/sessions.mjs read --id <session-uuid> --tail 12
 
 ## Ongoing communication
 
+In a persistent Bun MCP or CodeAct runtime, prefer direct imports for composition; see [the Bun API](references/bun-api.md). The CLI below uses the same implementation.
+
 ```sh
 bun <skill-dir>/scripts/sessions.mjs open --id <session-uuid> --pid <pid> --name "Codex · review"
 bun <skill-dir>/scripts/sessions.mjs send --channel <path> --text - <<'MESSAGE'

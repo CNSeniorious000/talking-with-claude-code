@@ -17,7 +17,9 @@ const fail = (code, message) => { throw new Failure(code, message); };
 const missing = e => e.code === 'ENOENT' || e.code === 'ESRCH';
 const normalize = s => String(s).trim().replace(/\s+/g, ' ');
 const options = {id:{type:'string'},pid:{type:'string'},text:{type:'string'},wait:{type:'string'},request:{type:'string'},channel:{type:'string'},name:{type:'string'},ttl:{type:'string'},timeout:{type:'string'},until:{type:'string'},'message-id':{type:'string'},'reply-ttl':{type:'string'},'sender-mode':{type:'string'},tail:{type:'string'},'max-chars':{type:'string'},before:{type:'string'},after:{type:'string'},events:{type:'boolean'},'no-preview':{type:'boolean'},'config-dir':{type:'string'},help:{type:'boolean'}};
-let args,positionals,command,root;
+// Each invocation owns its arguments: concurrent calls in a persistent Bun host must not share CLI state.
+async function execute(command,args,cli=false,positionals=[command]){
+let exitCode=0;const root=resolve(args['config-dir']||process.env.CLAUDE_CONFIG_DIR||join(homedir(),'.claude'));
 const number = (name, fallback, max) => { const value=args[name]===undefined?fallback:Number(args[name]); if(!Number.isSafeInteger(value)||value<0||value>max)fail('invalid_argument',`--${name} must be an integer between 0 and ${max}`); return value; };
 function sessionId() { if(!UUID.test(args.id||''))fail('invalid_argument','--id requires a full session UUID'); return args.id; }
 function readRegistration(file) {
@@ -273,19 +275,19 @@ async function openChannel(){
   const name=args.name;
   if(!name||name!==name.trim()||[...name].length>64||/["<>\p{C}\p{Zl}\p{Zp}]/u.test(name))fail('invalid_argument','--name requires 1–64 visible characters without quotes or angle brackets');
   const senderMode=permissionMode(),ttl=number('ttl',3600,86400);if(!ttl)fail('invalid_argument','--ttl must be between 1 and 86400 seconds');
-  const channelId=randomUUID(),{row,socket}=target(),inbox=await startReply(fileURLToPath(import.meta.url),row,socket,null,ttl,{id:channelId,name,senderMode});
+  const channelId=randomUUID(),{row,socket}=target(),inbox=await startReply(fileURLToPath(import.meta.url),row,socket,null,ttl,{id:channelId,name,senderMode},root);
   return {status:'open',channel:inbox.request,channelId,cursor:channelId+':0',address:inbox.address,name,sessionId:row.sessionId,pid:row.pid,expiresAt:inbox.expiresAt};
 }
 async function send() {
   const channel=args.channel?loadChannel(args.channel,{active:true}):null;
   const {row,socket}=channel?channel.data:target(),id=row.sessionId,pid=row.pid,senderMode=channel?channel.data.channel.senderMode:permissionMode(),name=channel?.data.channel.name;
   if(args.text===undefined)fail('invalid_argument','--text is required; use --text - to read stdin');
-  const text=args.text==='-'?await Bun.stdin.text():args.text;if(!text.trim())fail('invalid_argument','Message must not be empty');
+  const text=cli&&args.text==='-'?await Bun.stdin.text():args.text;if(!text.trim())fail('invalid_argument','Message must not be empty');
   const wait=number('wait',0,3600),ttl=number('reply-ttl',3600,86400);if(!ttl)fail('invalid_argument','--reply-ttl must be between 1 and 86400 seconds');
   if(args['message-id']&&!channel?.data.channel.id)fail('invalid_argument','Idempotent sends require a newly opened channel');
   validateTarget(row,socket);const msgId=args['message-id']?.toLowerCase()||randomUUID();
   let cursor=null;if(!channel)try{cursor=(await conversation(id,true)).messages.at(-1)?.id||null}catch(e){if(e.code!=='transcript_missing')throw e}
-  const inbox=channel?{request:channel.request,expiresAt:channel.data.expiresAt,address:channel.ready.address}:args.wait!==undefined?await startReply(fileURLToPath(import.meta.url),row,socket,msgId,ttl):null;
+  const inbox=channel?{request:channel.request,expiresAt:channel.data.expiresAt,address:channel.ready.address}:args.wait!==undefined?await startReply(fileURLToPath(import.meta.url),row,socket,msgId,ttl,undefined,root):null;
   let sent=false;
   try{
   // Native origin.from is not shown to the model. An explicit wrapper makes its return address actionable.
@@ -300,7 +302,7 @@ async function send() {
   sent=true;
   const result={status:outcome?.status||'submitted',acceptance:'unconfirmed',sessionId:id,pid,messageId:msgId,cursor,...outcome?.queuedAt&&{queuedAt:outcome.queuedAt},...outcome?{reused:outcome.reused,...outcome.sentAt&&{sentAt:outcome.sentAt}}:{sentAt:new Date().toISOString()},note:'Read the recipient transcript to verify receipt or completion. Do not infer either from this write.'};
   if(channel){Object.assign(result,{channel:channel.request,address:inbox.address,name,expiresAt:inbox.expiresAt});result.note='Use wait or follow --channel with its returned cursor as --after. Receipt events describe delivery, not task completion. Receiving an event does not close the channel.'}
-  else if(inbox){Object.assign(result,await waitReply(inbox.request,wait));result.note='Wait again with the same request; do not resend. The receiver stops on reply or expiry, and close --request removes cached state.';if(!['received','pending'].includes(result.reply.status))process.exitCode=2;}
+  else if(inbox){Object.assign(result,await waitReply(inbox.request,wait));result.note='Wait again with the same request; do not resend. The receiver stops on reply or expiry, and close --request removes cached state.';if(!['received','pending'].includes(result.reply.status))exitCode=2;}
   if(outcome?.reused)result.note+=' This call reused an existing message ID; it did not create a new delivery attempt.';
   return result;
   }catch(e){
@@ -366,19 +368,19 @@ async function main() {
           receipts.push(result.reply);after=result.cursor;
           if(!(result.reply.receipt.correlated&&['refused','denied','expired','dropped'].includes(result.reply.receipt.status)))continue;
         }
-        if(result.reply.status!=='received')process.exitCode=2;
+        if(result.reply.status!=='received')exitCode=2;
         return {...result,receipts};
       }
-      if(command==='wait'){if(!['received','receipt'].includes(result.reply.status))process.exitCode=2;return result}
+      if(command==='wait'){if(!['received','receipt'].includes(result.reply.status))exitCode=2;return result}
       if(result.reply.status==='timeout')continue;
       console.log(JSON.stringify(result));
-      if(!['received','receipt'].includes(result.reply.status)){process.exitCode=2;return}
+      if(!['received','receipt'].includes(result.reply.status)){exitCode=2;return}
       after=result.cursor;
     }while(true);
   }
   if(command==='wait'){
     const timeout=number('timeout',60,3600);if(!timeout)fail('invalid_argument','--timeout must be between 1 and 3600 seconds');
-    const result=await waitReply(args.request,timeout);if(result.reply.status!=='received')process.exitCode=2;return result;
+    const result=await waitReply(args.request,timeout);if(result.reply.status!=='received')exitCode=2;return result;
   }
   if(command==='read')return {sessionId:sessionId(),...page(await conversation(args.id,args.events))};
   if(command==='channels')return listChannels(root,validateTarget);
@@ -392,8 +394,28 @@ async function main() {
   const verified=sessions.filter(s=>s.processIdentity==='verified').length;
   return {capturedAt:new Date().toISOString(),configDir:root,counts:{verified,unverified:sessions.length-verified},sessions,warnings};
 }
-try {
-  ({values:args,positionals}=parseArgs({args:process.argv.slice(2),options,allowPositionals:true}));
-  command=positionals[0];root=resolve(args['config-dir']||process.env.CLAUDE_CONFIG_DIR||join(homedir(),'.claude'));
-  const result=await main();if(result!==undefined)console.log(JSON.stringify(result,null,2));
+const result=await main();return {result,exitCode};
+}
+
+/** Direct Bun API. Lifecycle outcomes are data; invalid arguments and transport failures throw errors with .code. */
+export function createSessions({configDir}={}){
+  const root=resolve(configDir||process.env.CLAUDE_CONFIG_DIR||join(homedir(),'.claude'));
+  const aliases={senderMode:'sender-mode',messageId:'message-id',replyTtl:'reply-ttl',maxChars:'max-chars',noPreview:'no-preview'};
+  const call=async(command,input={})=>{
+    const args={'config-dir':root};
+    for(const [key,value] of Object.entries(input)){
+      const flag=aliases[key]||key;
+      if(!Object.hasOwn(options,flag)||['config-dir','help'].includes(flag))fail('invalid_argument',`Unknown API option: ${key}`);
+      if(value===undefined)continue;
+      if(options[flag].type==='boolean'?typeof value!=='boolean':typeof value!=='string'&&typeof value!=='number')fail('invalid_argument',`Invalid API option: ${key}`);
+      args[flag]=options[flag].type==='boolean'?value:String(value);
+    }
+    return structuredClone((await execute(command,args)).result);
+  };
+  return Object.freeze(Object.fromEntries(['list','read','open','send','wait','status','channels','close'].map(command=>[command,input=>call(command,input)])));
+}
+
+if(import.meta.main)try {
+  const {values:args,positionals}=parseArgs({args:process.argv.slice(2),options,allowPositionals:true});
+  const {result,exitCode}=await execute(positionals[0],args,true,positionals);process.exitCode=exitCode;if(result!==undefined)console.log(JSON.stringify(result,null,2));
 } catch(e) { console.error(JSON.stringify({error:e.code||'failed',message:e.message,...e.request&&{request:e.request,expiresAt:e.expiresAt},...e.channel&&{channel:e.channel},...e.messageId&&{messageId:e.messageId}}));process.exitCode=1; }
