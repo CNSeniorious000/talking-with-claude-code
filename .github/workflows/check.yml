@@ -12,6 +12,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.4
+          bun-version: latest
       - run: bun test
-      - run: bunx --package typescript@5.9.3 tsc --noEmit --strict --module NodeNext --target ES2022 scripts/sessions.typecheck.mts
+      - run: bunx --package typescript tsc --noEmit --strict --module NodeNext --target ES2022 scripts/sessions.typecheck.mts
