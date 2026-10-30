@@ -9,6 +9,10 @@ const channel = await sessions.connect({ id: 'uuid', pid: 1, name: 'review', sen
 const address: ReplyAddress = channel.address;
 await channel.send({ text: 'hello', messageId: 'uuid' });
 const result = await channel.wait({ timeout: 20 });
+// @ts-expect-error wait results carry a cursor but are not recovery snapshots
+sessions.resumeChannel(result);
+// @ts-expect-error wait results do not include the target PID
+result.pid;
 if (result.reply.kind === 'reply') result.reply.text.toUpperCase();
 if (result.reply.kind === 'receipt') {
   result.reply.receipt.receivedAt.toUpperCase();
@@ -40,3 +44,7 @@ channel.cursor = '0';
 const wrongAddress: ReplyAddress = channel.handle;
 await channel.close();
 void address;
+
+await sessions.send({ id: 'uuid', pid: 1, text: 'reply later', wait: 0, replyTtl: 60 });
+// @ts-expect-error a return inbox lifetime requires opening a return inbox
+await sessions.send({ id: 'uuid', pid: 1, text: 'no inbox', replyTtl: 60 });

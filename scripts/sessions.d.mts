@@ -5,7 +5,7 @@ export interface OpenOptions extends Target { name: string; ttl?: number; sender
 export interface ChannelSendOptions { text: string; messageId?: string; senderMode?: never; channel?: never; id?: never; pid?: never }
 export type SendOptions =
   | (Omit<ChannelSendOptions, 'channel'> & { channel: string; wait?: never; replyTtl?: never })
-  | (Target & { text: string; senderMode?: SenderMode; wait?: number; replyTtl?: number; channel?: never; messageId?: never });
+  | (Target & { text: string; senderMode?: SenderMode; channel?: never; messageId?: never } & ({ wait?: never; replyTtl?: never } | { wait: number; replyTtl?: number }));
 export type WaitOptions =
   | { channel: string; after?: string; until?: 'reply'; timeout?: number; request?: never }
   | { request: string; timeout?: number; channel?: never; after?: never; until?: never };
