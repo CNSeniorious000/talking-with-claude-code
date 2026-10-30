@@ -1,6 +1,6 @@
 ---
 name: claude-code-sessions
-description: Read or message local Claude Code terminal sessions via Bun. Use for requested session inspection or communication, with Claude Code as the conversation source or recipient, and for troubleshooting sender-mode declarations, held/expired receipts or reply waits. General navigation, unrelated conceptual explanations and drafting alone do not need this skill.
+description: Read or message local Claude Code terminal sessions via Bun. Use for inspection or communication with Claude Code sessions, and questions about sender-mode, held/expired receipts or reply waits, including explanation-only requests. Consulting these instructions does not inspect sessions. General navigation, unrelated concepts and drafting alone do not need this skill.
 license: MIT
 compatibility: Bun, macOS or Linux, and local Claude Code session files. Sending requires Claude Code's native inbox socket.
 metadata:
