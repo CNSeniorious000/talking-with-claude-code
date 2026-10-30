@@ -708,12 +708,12 @@ test('reply waits share one deadline across receipt traffic and can resume after
   expect(continued.code).toBe(0);expect(continued.data.reply.text).toBe('late answer');expect(f.connections()).toBe(0);
 }),10000);
 
-test('reply waits stop on correlated refusal but leave the channel and later replies available',()=>fixture(async f=>{
+for(const terminal of ['refused','denied','expired','dropped'])test(`reply waits stop on correlated ${terminal} but leave the channel and later replies available`,()=>fixture(async f=>{
   const {channel,address}=(await openTestChannel(f)).data,sent=await f.run(['send','--channel',channel,'--text','check refusal']);
   const receipt=(id,status)=>({type:'control',from:'uds:'+f.socketPath,action:'peer_message_status',orig_msg_id:id,status});
-  postReply(address,[receipt(randomUUID(),'refused'),receipt(sent.data.messageId,'held'),receipt(sent.data.messageId,'refused'),channelFrame(f,'a later update')]);
+  postReply(address,[receipt(randomUUID(),terminal),receipt(sent.data.messageId,'held'),receipt(sent.data.messageId,terminal),channelFrame(f,'a later update')]);
   const result=await f.run(['wait','--channel',channel,'--until','reply','--timeout','2']);
-  expect(result.code).toBe(2);expect(result.data.reply.receipt).toMatchObject({status:'refused',correlated:true,messageId:sent.data.messageId});
+  expect(result.code).toBe(2);expect(result.data.reply.receipt).toMatchObject({status:terminal,correlated:true,messageId:sent.data.messageId});
   expect(result.data.receipts.map(r=>r.receipt.correlated)).toEqual([false,true,true]);expect(result.data.reply.seq).toBe(3);
   const next=await f.run(['wait','--channel',channel,'--after',result.data.cursor,'--until','reply','--timeout','1']);
   expect(next.code).toBe(0);expect(next.data.reply.text).toBe('a later update');expect(existsSync(channel)).toBe(true);expect(f.connections()).toBe(1);
@@ -793,10 +793,21 @@ test('concurrent retries of a channel message ID send once and expose a queryabl
   const {channel}=(await openTestChannel(f)).data,id=randomUUID(),args=['send','--channel',channel,'--message-id',id,'--text','exactly once'];
   const results=await Promise.all([f.run(args),f.run(args)]);
   expect(results.map(r=>r.code)).toEqual([0,0]);expect(f.connections()).toBe(1);
+  expect(results.map(r=>r.data.reused).sort()).toEqual([false,true]);expect(results[0].data.sentAt).toBeString();expect(results[1].data.sentAt).toBe(results[0].data.sentAt);
   expect((await f.run(['status','--channel',channel,'--message-id',id])).data).toMatchObject({messageId:id,status:'submitted'});
   expect((await f.run(['send','--channel',channel,'--message-id',id,'--text','different'])).data.error).toBe('idempotency_conflict');
   expect(f.connections()).toBe(1);
 }),10000);
+
+test('replaying an expired message ID preserves the original submission without redelivery',()=>fixture(async f=>{
+  const {channel,address}=(await openTestChannel(f)).data,id=randomUUID(),args=['send','--channel',channel,'--message-id',id,'--text','approval expired'];
+  const original=await f.run(args);expect(original.data.reused).toBe(false);
+  postReply(address,[{type:'control',from:'uds:'+f.socketPath,action:'peer_message_status',orig_msg_id:id,status:'expired',reason:'Held message expired without approval and was not delivered.'}]);
+  expect((await f.run(['wait','--channel',channel,'--until','reply','--timeout','1'])).data.reply.receipt.status).toBe('expired');
+  const replay=await f.run(args);expect(replay.data).toMatchObject({status:'submitted',reused:true,sentAt:original.data.sentAt});
+  expect(replay.data.note).toContain('did not create a new delivery attempt');expect(f.connections()).toBe(1);
+  expect((await f.run(['status','--channel',channel,'--message-id',id])).data.sentAt).toBe(original.data.sentAt);
+}));
 
 test('a paused channel worker returns queued with an ID and later submits the same job once',()=>fixture(async f=>{
   const {channel}=(await openTestChannel(f)).data,id=randomUUID(),pid=JSON.parse(readFileSync(channel.replace('request.json','ready.json'))).pid;

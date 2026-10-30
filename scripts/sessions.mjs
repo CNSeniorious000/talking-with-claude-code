@@ -298,9 +298,10 @@ async function send() {
   if(channel?.data.channel.id)outcome=await sendChannel(args.channel,payload,msgId);
   else await writeFrame(socket,payload,()=>{validateTarget(row,socket);if(channel)loadChannel(args.channel,{active:true})});
   sent=true;
-  const result={status:outcome?.status||'submitted',acceptance:'unconfirmed',sessionId:id,pid,messageId:msgId,cursor,...outcome?.queuedAt&&{queuedAt:outcome.queuedAt},...outcome?.status!=='queued'&&{sentAt:new Date().toISOString()},note:'Read the recipient transcript to verify receipt or completion. Do not infer either from this write.'};
+  const result={status:outcome?.status||'submitted',acceptance:'unconfirmed',sessionId:id,pid,messageId:msgId,cursor,...outcome?.queuedAt&&{queuedAt:outcome.queuedAt},...outcome?{reused:outcome.reused,...outcome.sentAt&&{sentAt:outcome.sentAt}}:{sentAt:new Date().toISOString()},note:'Read the recipient transcript to verify receipt or completion. Do not infer either from this write.'};
   if(channel){Object.assign(result,{channel:channel.request,address:inbox.address,name,expiresAt:inbox.expiresAt});result.note='Use wait or follow --channel with its returned cursor as --after. Receipt events describe delivery, not task completion. Receiving an event does not close the channel.'}
   else if(inbox){Object.assign(result,await waitReply(inbox.request,wait));result.note='Wait again with the same request; do not resend. The receiver stops on reply or expiry, and close --request removes cached state.';if(!['received','pending'].includes(result.reply.status))process.exitCode=2;}
+  if(outcome?.reused)result.note+=' This call reused an existing message ID; it did not create a new delivery attempt.';
   return result;
   }catch(e){
     if(channel)Object.assign(e,{channel:channel.request,messageId:msgId});
@@ -363,7 +364,7 @@ async function main() {
       if(untilReply){
         if(result.reply.kind==='receipt'){
           receipts.push(result.reply);after=result.cursor;
-          if(!(result.reply.receipt.correlated&&result.reply.receipt.status==='refused'))continue;
+          if(!(result.reply.receipt.correlated&&['refused','denied','expired','dropped'].includes(result.reply.receipt.status)))continue;
         }
         if(result.reply.status!=='received')process.exitCode=2;
         return {...result,receipts};

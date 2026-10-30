@@ -74,7 +74,7 @@ export async function receiveReply(request,validateTarget){
             try{
               if(job.messageId+'.json'!==name||typeof job.payload!=='string')throw failure('invalid_outgoing','Invalid queued message');
               if(Date.now()>=Date.parse(data.expiresAt))throw failure('channel_closed','Channel expired before sending');
-              await writeFrame(data.socket,job.payload,()=>validateTarget(data.row,data.socket));result={status:'submitted'};
+              await writeFrame(data.socket,job.payload,()=>validateTarget(data.row,data.socket));result={status:'submitted',sentAt:new Date().toISOString()};
             }catch(e){result={error:e.code||'failed',message:e.message}}
             // Retain correlation metadata, but discard the potentially large payload after attempting delivery.
             publish(outgoing,name,{messageId:job.messageId,hash:job.hash,queuedAt:job.queuedAt,result});
@@ -141,13 +141,13 @@ export function loadChannel(channel,{active=false}={}){
 export async function sendChannel(channel,payload,messageId){
   validMessageId(messageId);
   const {directory}=loadChannel(channel,{active:true}),outgoing=join(directory,'outgoing'),file=join(outgoing,messageId+'.json');
-  const hash=createHash('sha256').update(payload).digest('hex');
+  const hash=createHash('sha256').update(payload).digest('hex');let reused=true;
   if(!existsSync(file)){
     const entries=readdirSync(outgoing).filter(name=>name.endsWith('.json'));
     if(entries.length>=1024||entries.reduce((size,name)=>size+lstatSync(join(outgoing,name)).size,0)+Buffer.byteLength(payload)>16*1024*1024)throw failure('outgoing_full','Channel outgoing journal is full; drain it before opening a new channel');
     const temporary=file+'.'+randomUUID()+'.tmp';
     // link() publishes a complete job only if its ID is still unused, including concurrent retries.
-    try{writeFileSync(temporary,JSON.stringify({messageId,hash,payload,queuedAt:new Date().toISOString()}),{flag:'wx',mode:0o600});try{linkSync(temporary,file)}catch(e){if(e.code!=='EEXIST')throw e}}
+    try{writeFileSync(temporary,JSON.stringify({messageId,hash,payload,queuedAt:new Date().toISOString()}),{flag:'wx',mode:0o600});try{linkSync(temporary,file);reused=false}catch(e){if(e.code!=='EEXIST')throw e}}
     finally{try{unlinkSync(temporary)}catch(e){if(e.code!=='ENOENT')throw e}}
   }
   const job=privateFile(file);if(job.hash!==hash)throw failure('idempotency_conflict','This message ID was already used with different content');
@@ -156,7 +156,7 @@ export async function sendChannel(channel,payload,messageId){
   try{result=await observe(outgoing,()=>privateFile(file).result,10)}
   catch(e){if(e.code==='ENOENT')throw failure('outcome_unknown','Channel state was removed during submission; do not resend with a new ID');throw e}
   if(result?.error)throw failure(result.error,result.message);
-  return {...result||{status:'queued'},queuedAt:job.queuedAt};
+  return {...result||{status:'queued'},queuedAt:job.queuedAt,reused};
 }
 export function outgoingStatus(channel,messageId){
   validMessageId(messageId);
